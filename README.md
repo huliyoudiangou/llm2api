@@ -21,11 +21,14 @@
 ## 快速开始
 
 ```bash
-# 直接运行（默认免登录，监听 0.0.0.0:8000）
+# 直接运行（默认免登录，仅监听本机 127.0.0.1:8000）
 go run main.go
 
 # 指定端口并启用管理面板密码
 go run main.go -port 8080 -password mypass
+
+# 需要局域网访问时显式放开监听，并务必同时设置密码
+go run main.go -listen 0.0.0.0 -port 8080 -password mypass
 ```
 
 浏览器打开 `http://localhost:8000/` 进入管理面板。默认 `-password` 为空——直接可用；指定密码后需先登录。
@@ -46,6 +49,7 @@ go run main.go -port 8080 -password mypass
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `-port` | `8000` | 监听端口 |
+| `-listen` | `127.0.0.1` | 监听地址；默认仅本机回环。需要局域网访问时指定（如 `-listen 0.0.0.0`），**并务必同时设置 `-password`** |
 | `-config` | `config.json` | 配置文件路径 |
 | `-password` | `""` | 管理面板密码；**留空则不启用认证**（直接打开即用） |
 | `-debug` | `false` | 打印详细请求/响应日志 |
@@ -143,7 +147,7 @@ go run main.go -port 8080 -password mypass
 - 有多把 Key → **立即切下一把 Key**，不等待
 - 只有一把 Key → 指数退避重试（1s → 2s → 4s … 30s 封顶）
 
-不再解析上游的 `Retry-After` 响应头（不同上游格式不一致，避免歧义）。
+每个请求的「状态码重试」（含多 Key 切换）最多 8 次，超过后把最后一次上游错误原样返回客户端——避免上游持续 429/5xx 时形成零等待重试风暴。传输级错误（拨号失败/连接重置）另有 4 次上限。不再解析上游的 `Retry-After` 响应头（不同上游格式不一致，避免歧义）。
 
 ### 按模型选择 SOCKS5 出口
 
@@ -238,5 +242,7 @@ llm2api/
 - 仅在上游要求或支持历史 `reasoning_content` 时启用 `with_reasoning`；不支持该字段的上游可能拒绝请求
 - Anthropic 直通模式下，系统消息中的 `x-anthropic-billing-header` 会被自动清洗
 - 流式请求会自动注入 `stream_options.include_usage: true` 以确保 token 统计准确
-- 管理面板 `-password` 默认为空（不启用认证），请仅在可信网络中使用；需启用认证时用 `-password` 指定
+- 管理面板 `-password` 默认为空（不启用认证）。**服务默认只监听本机回环 `127.0.0.1`**，局域网设备无法访问；确需局域网访问时用 `-listen 0.0.0.0` 放开并务必同时设置 `-password`
+- 管理接口的写请求（POST/DELETE）带异源 `Origin` 头时会被拒绝（防跨站 CSRF）；`curl` 等不带 `Origin` 的脚本不受影响
+- `config.json` / `stats.json` / `pricing.json` 均为「临时文件 + 原子改名」写入，进程崩溃不会留下半截 JSON；文件损坏时启动会备份为 `*.bad-<时间戳>` 后再以空配置继续，不再用空配置覆盖原件
 - 已不再有"默认上游"概念：所有别名必须显式指定上游；客户端只能用已配置的别名调 `/v1/*`

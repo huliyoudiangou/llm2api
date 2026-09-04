@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -43,6 +46,20 @@ const upstreamResponseHeaderTimeout = 45 * time.Second
 // 此前该循环无上界：上游不可达时会 1s 一次无限重试，直到客户端自己超时，
 // 既打爆日志又占满连接，并在客户端自动重试下形成重试风暴。
 const maxTransportRetries = 4
+
+// maxStatusRetries 单个客户端请求允许的「上游 429/5xx 状态码重试」次数上限。
+// 此前状态码重试无上界：多 Key 时零等待紧循环（实测恒 429 的上游 13 秒被打 4221 次），
+// 单 Key 指数退避也无限重试，流式客户端不设超时时永不停止。
+// 超过上限后把最后一次上游错误原样返回给客户端，保留「多 Key 立即切换」语义但整请求封顶。
+const maxStatusRetries = 8
+
+// 上游响应读取上限：非流式成功响应 128MB、错误响应 1MB（错误体只需容纳错误 JSON，超出部分无意义）。
+// 上游由用户自行配置、通常是可信服务，但行为异常/被劫持的上游返回超大响应时不应拖垮网关。
+const (
+	maxUpstreamResponseBytes   = 128 << 20
+	maxUpstreamErrorBodyBytes  = 1 << 20
+	maxUpstreamModelsBodyBytes = 10 << 20
+)
 
 // newBaseTransport 构造上游 HTTP 传输层。
 // stream=true 时额外设置 ResponseHeaderTimeout：只约束「等到响应头」的时间，
@@ -453,6 +470,9 @@ func markAPIKeyFailure(key string, statusCode int, reason string) {
 		keyHealth[key] = st
 	}
 	st.failCount++
+	if len(reason) > 200 {
+		reason = reason[:200]
+	}
 	st.lastError = reason
 
 	cooldown := 30 * time.Second
@@ -822,10 +842,13 @@ func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, err
 	var lastErr error
 	proxyAddr := getFirstConfiguredSocks5ProxyAddr()
 	client, _ := getModelHTTPClient(proxyAddr, false)
+	// 探测是管理面板触发的在线操作：整体限时，避免不可达上游把请求挂满 600s
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	for i := 0; i < len(apiKeys); i++ {
 		apiKeyIndex := (start + i) % len(apiKeys)
 		apiKey := apiKeys[apiKeyIndex]
-		req, err := http.NewRequest("GET", endpoint, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -844,7 +867,7 @@ func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, err
 			lastErr = err
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamModelsBodyBytes))
 		resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			var raw map[string]any
@@ -902,13 +925,21 @@ func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, err
 			lastErr = fmt.Errorf("models endpoint retryable status %d on key %s", resp.StatusCode, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)))
 			continue
 		}
-		lastErr = fmt.Errorf("models endpoint status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		lastErr = fmt.Errorf("models endpoint status %d: %s", resp.StatusCode, truncateForLog(strings.TrimSpace(string(body)), 512))
 		break
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("models endpoint request failed")
 	}
 	return nil, lastErr
+}
+
+// truncateForLog 截断用于日志/错误信息的文本，防止大响应体撑爆日志与内存
+func truncateForLog(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + fmt.Sprintf("...(truncated %d bytes)", len(s)-limit)
 }
 
 // emptyCustomModelUpstreams 返回 normalize 后 custom_models 仍为空的上游名（已按名排序）。
@@ -1009,11 +1040,72 @@ var (
 
 // ======================== 管理面板认证 ========================
 
+const (
+	sessionTTL      = 7 * 24 * time.Hour // 会话有效期；过期后需重新登录
+	maxLoginFails   = 5                  // 连续失败阈值，超过后按指数退避锁定
+	maxLoginLockout = 30 * time.Second   // 登录锁定上限
+)
+
 var (
 	adminPassword string
-	sessions      = map[string]struct{}{}
+	sessions      = map[string]time.Time{} // token -> 过期时间
 	sessionsMu    sync.Mutex
 )
+
+// loginThrottle 按来源 IP 记录连续失败次数，防止管理面板密码被无限速暴力破解
+var (
+	loginThrottleMu sync.Mutex
+	loginThrottle   = map[string]*loginFailState{}
+)
+
+type loginFailState struct {
+	fails       int
+	lockoutFor  time.Duration
+	lockedUntil time.Time
+}
+
+func loginThrottleCheck(ip string) (blocked bool, retryAfter time.Duration) {
+	loginThrottleMu.Lock()
+	defer loginThrottleMu.Unlock()
+	st, ok := loginThrottle[ip]
+	if !ok {
+		return false, 0
+	}
+	if now := time.Now(); now.Before(st.lockedUntil) {
+		return true, st.lockedUntil.Sub(now)
+	}
+	return false, 0
+}
+
+func loginThrottleMarkFail(ip string) {
+	loginThrottleMu.Lock()
+	defer loginThrottleMu.Unlock()
+	st, ok := loginThrottle[ip]
+	if !ok {
+		st = &loginFailState{}
+		if len(loginThrottle) > 4096 {
+			// 防止被伪造来源刷爆内存：超限时直接重置表（正在锁定的极少数会提前解锁，可接受）
+			loginThrottle = map[string]*loginFailState{}
+		}
+		loginThrottle[ip] = st
+	}
+	st.fails++
+	if st.fails >= maxLoginFails {
+		if st.lockoutFor == 0 {
+			st.lockoutFor = time.Second
+		} else if st.lockoutFor < maxLoginLockout {
+			st.lockoutFor *= 2
+		}
+		st.lockedUntil = time.Now().Add(st.lockoutFor)
+		st.fails = 0
+	}
+}
+
+func loginThrottleReset(ip string) {
+	loginThrottleMu.Lock()
+	defer loginThrottleMu.Unlock()
+	delete(loginThrottle, ip)
+}
 
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -1027,7 +1119,11 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		sessionsMu.Lock()
-		_, ok := sessions[cookie.Value]
+		expiry, ok := sessions[cookie.Value]
+		if ok && time.Now().After(expiry) {
+			delete(sessions, cookie.Value)
+			ok = false
+		}
 		sessionsMu.Unlock()
 		if !ok {
 			http.Redirect(w, r, "/login", http.StatusFound)
@@ -1045,29 +1141,100 @@ func generateToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
+// sameOriginWriteGuard 校验写请求的 Origin / Sec-Fetch-Site，拦截跨站 CSRF：
+// 浏览器对同源 fetch POST 总是带同源 Origin 头；跨站 no-cors POST（text/plain 等免预检
+// Content-Type）会带异源 Origin，这里直接拒绝。curl 等脚本不带 Origin 头，不受影响。
+func sameOriginWriteGuard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost && r.Method != http.MethodPut && r.Method != http.MethodDelete && r.Method != http.MethodPatch {
+			next(w, r)
+			return
+		}
+		if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "same-site" && site != "none" {
+			log.Printf("[security] 拒绝跨站写请求: %s %s Sec-Fetch-Site=%s from %s", r.Method, r.URL.Path, site, r.RemoteAddr)
+			http.Error(w, `{"error":"cross-site write rejected"}`, http.StatusForbidden)
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" && origin != "null" {
+			u, err := url.Parse(origin)
+			if err != nil || !sameHostPort(u, r.Host) {
+				log.Printf("[security] 拒绝跨站写请求: %s %s Origin=%q Host=%q from %s", r.Method, r.URL.Path, origin, r.Host, r.RemoteAddr)
+				http.Error(w, `{"error":"cross-site write rejected"}`, http.StatusForbidden)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// sameHostPort 比较 Origin URL 的 host:port 与请求 Host 头是否同源（补齐 http 默认端口 80 / https 443）
+func sameHostPort(u *url.URL, requestHost string) bool {
+	if u == nil || requestHost == "" {
+		return false
+	}
+	originPort := u.Port()
+	if originPort == "" {
+		switch u.Scheme {
+		case "https":
+			originPort = "443"
+		default:
+			originPort = "80"
+		}
+	}
+	reqHost := requestHost
+	reqPort := ""
+	if h, p, err := net.SplitHostPort(requestHost); err == nil {
+		reqHost, reqPort = h, p
+	} else {
+		if strings.HasSuffix(requestHost, "]") { // IPv6 无端口
+			reqHost = requestHost
+		} else {
+			reqPort = "80"
+		}
+	}
+	return strings.EqualFold(u.Hostname(), reqHost) && originPort == reqPort
+}
+
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if adminPassword == "" {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 	if r.Method == http.MethodPost {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if blocked, retryAfter := loginThrottleCheck(ip); blocked {
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+			renderLoginPage(w, "尝试过于频繁，请稍后再试")
+			return
+		}
+		// 登录表单只有几个字段：限制请求体，防止超大表单把内存读爆
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := r.ParseForm(); err != nil {
 			renderLoginPage(w, "表单解析失败")
 			return
 		}
-		if r.FormValue("password") != adminPassword {
+		// 常数时间比较：先把两侧都散列成定长摘要，避免长度与逐字节时序泄露
+		sum := sha256.Sum256([]byte(r.FormValue("password")))
+		got := sha256.Sum256([]byte(adminPassword))
+		if subtle.ConstantTimeCompare(sum[:], got[:]) != 1 {
+			loginThrottleMarkFail(ip)
 			renderLoginPage(w, "密码错误")
 			return
 		}
+		loginThrottleReset(ip)
 		token, err := generateToken()
 		if err != nil {
 			renderLoginPage(w, "创建会话失败")
 			return
 		}
 		sessionsMu.Lock()
-		sessions[token] = struct{}{}
+		if len(sessions) > 1000 {
+			// 会话数异常膨胀（理论上不可能）：丢弃全部旧会话，强制重新登录
+			sessions = map[string]time.Time{}
+		}
+		sessions[token] = time.Now().Add(sessionTTL)
 		sessionsMu.Unlock()
-		http.SetCookie(w, &http.Cookie{Name: "session", Value: token, Path: "/", HttpOnly: true})
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
@@ -1362,18 +1529,31 @@ type ReasonEffort struct {
 
 // ======================== 配置管理 ========================
 
-func loadConfig(path string) AppConfig {
-	var cfg AppConfig
+// loadConfig 读取配置。返回值 ok=false 表示文件存在但解析失败（已把原件备份为 *.bad-*），
+// 调用方不应再用空配置覆盖写回，否则会销毁用户唯一的配置原件。
+func loadConfig(path string) (cfg AppConfig, ok bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			normalizeConfig(&cfg)
+			return cfg, true
+		}
 		normalizeConfig(&cfg)
-		return cfg
+		return cfg, false
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		log.Printf("警告: 配置文件解析失败: %v", err)
+		backup := backupCorruptFile(path)
+		if backup != "" {
+			log.Printf("警告: 配置文件解析失败: %v", err)
+			log.Printf("警告: 原文件已备份为 %s，修复后可改名回 config.json 重启恢复", backup)
+		} else {
+			log.Printf("警告: 配置文件解析失败: %v（备份失败，请手工检查 %s）", err, path)
+		}
+		normalizeConfig(&cfg)
+		return cfg, false
 	}
 	normalizeConfig(&cfg)
-	return cfg
+	return cfg, true
 }
 
 func normalizeConfig(cfg *AppConfig) {
@@ -1433,13 +1613,37 @@ func normalizeConfig(cfg *AppConfig) {
 	}
 }
 
+// writeFileAtomic 原子写文件：先写同目录临时文件，再 rename 覆盖。
+// 直接 os.WriteFile 目标文件时，进程崩溃/断电会留下截断的 JSON，
+// 下次启动解析失败后数据即被清空（实测 config.json 被重写为空配置）。
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// backupCorruptFile 把解析失败的文件改名留证（<path>.bad-<时间戳>），避免后续写入覆盖掉仅存的原件
+func backupCorruptFile(path string) string {
+	backup := fmt.Sprintf("%s.bad-%s", path, time.Now().Format("20060102-150405"))
+	if err := os.Rename(path, backup); err != nil {
+		return ""
+	}
+	return backup
+}
+
 func saveConfig(path string, cfg AppConfig) error {
 	normalizeConfig(&cfg)
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return writeFileAtomic(path, data, 0644)
 }
 
 func applyConfig(cfg AppConfig) bool {
@@ -1551,6 +1755,13 @@ func loadTokenStats() {
 	}
 	var st TokenStatsData
 	if err := json.Unmarshal(data, &st); err != nil {
+		// 损坏的统计文件改名留证；否则首次保存就会把仅存的原件覆盖掉
+		backup := backupCorruptFile(tokenStatsPath)
+		if backup != "" {
+			log.Printf("警告: stats.json 解析失败: %v，原文件已备份为 %s", err, backup)
+		} else {
+			log.Printf("警告: stats.json 解析失败: %v（备份失败，请手工检查 %s）", err, tokenStatsPath)
+		}
 		checkAndResetDailyStats()
 		return
 	}
@@ -1722,7 +1933,7 @@ func saveTokenStats() {
 	if err != nil {
 		return
 	}
-	os.WriteFile(tokenStatsPath, data, 0644)
+	writeFileAtomic(tokenStatsPath, data, 0644)
 }
 
 // markUsageDirty 由请求路径调用，实际的磁盘写入由 startUsageSaveWorker 合并执行，
@@ -1799,7 +2010,7 @@ func savePricing(p PricingConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(pricingPath, data, 0644)
+	return writeFileAtomic(pricingPath, data, 0644)
 }
 
 func getPricingSnapshot() PricingConfig {
@@ -4139,7 +4350,8 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream, modelID)
 	retryDelay := 1 * time.Second
-	fastRetries := 0 // 传输级错误的 0ms 快速重试计数（仅前 2 次，之后回落 1s 退避）
+	fastRetries := 0   // 传输级错误的 0ms 快速重试计数（仅前 2 次，之后回落 1s 退避）
+	statusRetries := 0 // 上游 429/5xx 状态码重试计数（含多 Key 切换），超过 maxStatusRetries 放弃
 	proxyLabel := modelProxyLabel(proxyAddr)
 	for {
 		select {
@@ -4208,8 +4420,13 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 			rec.SetUpstream(upstreamName)
 			rec.SetStatus(resp.StatusCode)
 			rec.MarkFirstToken()
-			b, readErr := io.ReadAll(resp.Body)
+			// 非流式响应需要整体读入做协议转换：限制单响应上限，
+			// 防止行为异常的上游返回超大响应把网关内存吃满（流式路径逐行转发不受影响）
+			b, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBytes+1))
 			resp.Body.Close()
+			if readErr == nil && len(b) > maxUpstreamResponseBytes {
+				return nil, 0, nil, fmt.Errorf("upstream response exceeds %d bytes", maxUpstreamResponseBytes)
+			}
 			if readErr != nil {
 				return nil, 0, nil, readErr
 			}
@@ -4222,13 +4439,20 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 			}
 			return b, resp.StatusCode, resp.Header, nil
 		}
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
 		resp.Body.Close()
 		markAPIKeyFailure(apiKey, resp.StatusCode, string(errBody))
 		errRec := usageRecorderFromContext(ctx)
 		errRec.SetUpstream(upstreamName)
 		errRec.SetStatus(resp.StatusCode)
 		if shouldRetryUpstreamStatus(resp.StatusCode) {
+			statusRetries++
+			if statusRetries > maxStatusRetries {
+				log.Printf("[upstream retry exhausted] api=%s upstream=%s model=%s key=%s proxy=%s status=%d status_retries=%d", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, statusRetries-1)
+				errRec.SetError(fmt.Sprintf("upstream %d persisted after %d retries", resp.StatusCode, maxStatusRetries))
+				errBody = mapUpstreamErrorBody(errBody, upstream.APIType)
+				return errBody, resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream status %d persisted after %d retries", resp.StatusCode, maxStatusRetries)
+			}
 			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
 			manyKeys := len(apiKeys) > 1
 			if manyKeys {
@@ -4281,7 +4505,8 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream, modelID)
 	retryDelay := 1 * time.Second
-	fastRetries := 0 // 传输级错误的 0ms 快速重试计数（仅前 2 次，之后回落 1s 退避）
+	fastRetries := 0   // 传输级错误的 0ms 快速重试计数（仅前 2 次，之后回落 1s 退避）
+	statusRetries := 0 // 上游 429/5xx 状态码重试计数（含多 Key 切换），超过 maxStatusRetries 放弃
 	proxyLabel := modelProxyLabel(proxyAddr)
 	for {
 		select {
@@ -4376,13 +4601,20 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 			rec.SetStatus(resp.StatusCode)
 			return wrappedBody, resp.StatusCode, resp.Header, nil
 		}
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
 		resp.Body.Close()
 		markAPIKeyFailure(apiKey, resp.StatusCode, string(errBody))
 		errRec := usageRecorderFromContext(ctx)
 		errRec.SetUpstream(upstreamName)
 		errRec.SetStatus(resp.StatusCode)
 		if shouldRetryUpstreamStatus(resp.StatusCode) {
+			statusRetries++
+			if statusRetries > maxStatusRetries {
+				log.Printf("[upstream retry exhausted] api=%s upstream=%s model=%s key=%s proxy=%s status=%d status_retries=%d", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, statusRetries-1)
+				errRec.SetError(fmt.Sprintf("upstream %d persisted after %d retries", resp.StatusCode, maxStatusRetries))
+				errBody = mapUpstreamErrorBody(errBody, upstream.APIType)
+				return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream status %d persisted after %d retries", resp.StatusCode, maxStatusRetries)
+			}
 			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
 			manyKeys := len(apiKeys) > 1
 			if manyKeys {
@@ -8080,7 +8312,8 @@ func upstreamModelsHandler(w http.ResponseWriter, r *http.Request) {
 	var probe *UpstreamConfig
 	if r.Method == http.MethodPost && r.Body != nil {
 		// 优先用请求体里的临时配置(未保存也能拉取),实现"填好 URL+key 直接试拉"。
-		data, err := io.ReadAll(r.Body)
+		// 请求体必须限长：无上限 ReadAll 时单个百 MB POST 就能把进程内存放大数十倍（实测 8.5MB→360MB）。
+		data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 10<<20))
 		if err != nil {
 			http.Error(w, "read body failed", http.StatusBadRequest)
 			return
@@ -8191,6 +8424,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(resp)
 	case http.MethodPost:
 		var cfg AppConfig
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 			http.Error(w, `{"error":"Invalid JSON"}`, http.StatusBadRequest)
 			return
@@ -8610,6 +8844,7 @@ func adminPricingHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(getPricingSnapshot())
 	case http.MethodPost:
 		var p PricingConfig
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			http.Error(w, `{"error":"Invalid JSON"}`, http.StatusBadRequest)
 			return
@@ -9483,16 +9718,22 @@ func startConnectionKeepAliveWorker() {
 // ======================== Main ========================
 
 func main() {
+	listenAddr := "127.0.0.1"
+	flag.StringVar(&listenAddr, "listen", "127.0.0.1", "监听地址；默认仅本机回环，需要局域网访问时显式指定（如 -listen 0.0.0.0）并务必设置 -password")
 	flag.StringVar(&port, "port", "8000", "服务端口")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
 	flag.StringVar(&adminPassword, "password", "", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
 	flag.Parse()
 
-	cfg := loadConfig(configPath)
+	// ok=false 表示配置文件损坏（原件已备份为 *.bad-*）：
+	// 此时禁止把空配置写回磁盘，否则用户仅存的配置原件会被销毁。
+	cfg, configOK := loadConfig(configPath)
 	applyConfig(cfg)
-	if err := saveConfig(configPath, cfg); err != nil {
-		log.Printf("警告: 无法保存配置: %v", err)
+	if configOK {
+		if err := saveConfig(configPath, cfg); err != nil {
+			log.Printf("警告: 无法保存配置: %v", err)
+		}
 	}
 
 	loadTokenStats()
@@ -9511,21 +9752,24 @@ func main() {
 		log.Printf("管理面板: http://localhost:%s/ （密码认证已启用）", port)
 	} else {
 		log.Printf("管理面板: http://localhost:%s/ （无密码）", port)
+		if listenAddr != "127.0.0.1" && listenAddr != "localhost" && listenAddr != "::1" {
+			log.Printf("警告: 未设置 -password 且监听 %s —— 局域网内任何人可读写配置与全部上游 API Key", listenAddr)
+		}
 	}
 	log.Printf("===================")
 	http.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
 	http.HandleFunc("/v1/responses", responsesHandler)
 	http.HandleFunc("/v1/messages", anthropicMessagesHandler)
 	http.HandleFunc("/v1/models", listModelsHandler)
-	http.HandleFunc("/login", loginHandler)
-	http.HandleFunc("/logout", logoutHandler)
-	http.HandleFunc("/api/config", requireAuth(adminConfigHandler))
-	http.HandleFunc("/api/stats", requireAuth(adminStatsHandler))
-	http.HandleFunc("/api/usage", requireAuth(adminUsageHandler))
-	http.HandleFunc("/api/usage/log", requireAuth(adminUsageLogHandler))
-	http.HandleFunc("/api/pricing", requireAuth(adminPricingHandler))
-	http.HandleFunc("/api/reload", requireAuth(reloadHandler))
-	http.HandleFunc("/api/upstream/models", requireAuth(upstreamModelsHandler))
+	http.HandleFunc("/login", sameOriginWriteGuard(loginHandler))
+	http.HandleFunc("/logout", sameOriginWriteGuard(logoutHandler))
+	http.HandleFunc("/api/config", requireAuth(sameOriginWriteGuard(adminConfigHandler)))
+	http.HandleFunc("/api/stats", requireAuth(sameOriginWriteGuard(adminStatsHandler)))
+	http.HandleFunc("/api/usage", requireAuth(sameOriginWriteGuard(adminUsageHandler)))
+	http.HandleFunc("/api/usage/log", requireAuth(sameOriginWriteGuard(adminUsageLogHandler)))
+	http.HandleFunc("/api/pricing", requireAuth(sameOriginWriteGuard(adminPricingHandler)))
+	http.HandleFunc("/api/reload", requireAuth(sameOriginWriteGuard(reloadHandler)))
+	http.HandleFunc("/api/upstream/models", requireAuth(sameOriginWriteGuard(upstreamModelsHandler)))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
@@ -9537,7 +9781,7 @@ func main() {
 		}
 		http.NotFound(w, r)
 	})
-	addr := ":" + port
+	addr := net.JoinHostPort(listenAddr, port)
 	log.Printf("服务器启动在 %s", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
