@@ -226,26 +226,6 @@ llm2api/
 | `stats.json` | 使用统计（每日聚合 + 请求明细） |
 | `pricing.json` | 费用估算单价（可选） |
 
-## 配置与密钥安全
-
-`config.json` 里保存的是**真实上游 API Key**。如果你把本项目纳入自己的 git 仓库，
-请先忽略这些本地文件，避免误提交：
-
-```bash
-cat >> .git/info/exclude <<'EOF'
-config.json
-stats.json
-pricing.json
-*.exe
-*.log
-EOF
-```
-
-（`.git/info/exclude` 只在本地生效、不会进入仓库内容，适合个人部署。）
-
-> 若不慎把含密钥的 `config.json` 提交过，仅删除文件不足以撤销：密钥仍留在 git 历史中，
-> 应立即**吊销并轮换**对应上游的 Key。
-
 ## 环境要求
 
 - Go 1.21+
