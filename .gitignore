@@ -1,0 +1,43 @@
+# ---------- 密钥：绝不入库 ----------
+# config.json 含真实上游 API Key（bai / flatkey / 英伟达 53 个），只保留本地。
+# 首次运行会自动生成空配置，无需提交任何模板文件。
+config.json
+*.local.json
+.env
+.env.*
+
+# ---------- 本机专用笔记（记录本地网络/代理约束，对他人无价值）----------
+PROXY-NOTES.md
+
+# ---------- 编译产物 ----------
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+llm-gateway
+main
+
+# ---------- 手工备份（版本管理交给 git，不要再散落 *.bak）----------
+*.bak
+*.bak-*
+*.orig
+*.rej
+*~
+
+# ---------- 运行时自动生成的数据 ----------
+stats.json
+pricing.json
+*.log
+
+# ---------- 工具临时目录 ----------
+.dsh-vision-toolkit/
+
+# ---------- Go / 编辑器 ----------
+/vendor/
+*.test
+*.out
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
