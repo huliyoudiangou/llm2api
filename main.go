@@ -29,11 +29,29 @@ import (
 // 冷启动新建连接时走 TLS 会话恢复（session ticket / PSK），省 1 个 RTT 的完整握手。
 var sharedTLSSessionCache = tls.NewLRUClientSessionCache(128)
 
-func newBaseTransport() *http.Transport {
-	return &http.Transport{
+// upstreamDialTimeout 拨号超时。Windows 下直连不可达的上游（SYN 被黑洞丢弃）
+// 实测要 ~21s 才失败，30s 偏长；收紧到 10s，让「上游不可达」快速失败并进入
+// 重试/报错路径，而不是长时间挂着。
+const upstreamDialTimeout = 10 * time.Second
+
+// upstreamResponseHeaderTimeout 限制「请求已发出、但上游迟迟不返回响应头」的等待时间。
+// 没有这个上限时，僵死的代理链路或不可达上游会一直挂着：客户端 300s 超时掐断后，
+// 网关侧连接与 goroutine 仍滞留，表现为明细里 300s+ 且 0 token 的记录。
+const upstreamResponseHeaderTimeout = 45 * time.Second
+
+// maxTransportRetries 传输级错误（拨号失败/连接重置/代理不可达）的总尝试次数上限。
+// 此前该循环无上界：上游不可达时会 1s 一次无限重试，直到客户端自己超时，
+// 既打爆日志又占满连接，并在客户端自动重试下形成重试风暴。
+const maxTransportRetries = 4
+
+// newBaseTransport 构造上游 HTTP 传输层。
+// stream=true 时额外设置 ResponseHeaderTimeout：只约束「等到响应头」的时间，
+// 一旦开始流式输出就不该再受它限制（长流由 client.Timeout=0 保证不被截断）。
+func newBaseTransport(stream bool) *http.Transport {
+	t := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
+			Timeout:   upstreamDialTimeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
@@ -44,16 +62,20 @@ func newBaseTransport() *http.Transport {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	if stream {
+		t.ResponseHeaderTimeout = upstreamResponseHeaderTimeout
+	}
+	return t
 }
 
 var httpClient = &http.Client{
 	Timeout:   600 * time.Second,
-	Transport: newBaseTransport(),
+	Transport: newBaseTransport(false),
 }
 
 var streamHTTPClient = &http.Client{
 	Timeout:   0,
-	Transport: newBaseTransport(),
+	Transport: newBaseTransport(true),
 }
 
 // ======================== SOCKS5 代理 ========================
@@ -256,7 +278,7 @@ func getModelHTTPClient(proxyAddr string, stream bool) (*http.Client, string) {
 	if client := socks5Clients[key]; client != nil {
 		return client, socks5ProxyLabel(proxy)
 	}
-	transport := newBaseTransport()
+	transport := newBaseTransport(stream)
 	// SOCKS5 客户端必须直连代理本身：清掉 ProxyFromEnvironment，
 	// 避免环境变量里的 HTTP(S)_PROXY 叠加成 socks5→env-proxy 双层链路（多一跳延迟）
 	transport.Proxy = nil
@@ -540,6 +562,10 @@ func formatUpstreamAPIKeySlot(index int, total int) string {
 	return fmt.Sprintf("%d/%d", index+1, total)
 }
 
+// waitForRetry 在重试前等待退避；ctx 取消时返回错误。
+// 取消即代表客户端已断开，这里统一把 usageRecorder 标记为 499：
+// 否则调用方直接 `return nil, 0, nil, err` 会让明细落下 status=0，
+// 前端把 0 当成功渲染成绿色 200，超时/断开的请求在统计里被误记为成功。
 func waitForRetry(ctx context.Context, baseDelay time.Duration) error {
 	delay := baseDelay
 	if delay <= 0 {
@@ -549,6 +575,9 @@ func waitForRetry(ctx context.Context, baseDelay time.Duration) error {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		rec := usageRecorderFromContext(ctx)
+		rec.SetStatus(499)
+		rec.SetError("client disconnected")
 		return ctx.Err()
 	case <-timer.C:
 		return nil
@@ -2126,6 +2155,22 @@ func commitUsage(snap usageCommit, latencyMs int64) {
 	model, target, upstream := snap.model, snap.target, snap.upstream
 	api, errMsg, status := snap.api, snap.errMsg, snap.status
 	usage, haveUsage, firstTokenMs := snap.usage, snap.haveUsage, snap.firstTokenMs
+
+	// status==0 表示从未拿到上游 2xx（成功路径都会显式 SetStatus）。
+	// 兜底归一化，避免任何未覆盖的分支落下 status=0 被前端当成成功。
+	if status == 0 {
+		if latencyMs > 0 {
+			status = 499 // 已发出请求但未拿到响应：客户端断开或超时
+			if errMsg == "" {
+				errMsg = "no upstream response (timeout or client disconnect)"
+			}
+		} else {
+			status = 400 // 请求在进入上游前就被拒
+			if errMsg == "" {
+				errMsg = "request rejected"
+			}
+		}
+	}
 
 	if model == "" {
 		model = target
@@ -4129,8 +4174,16 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 		resp, err := c.Do(up)
 		if err != nil {
 			// 传输级错误：前两次 0ms 立即重试（等 1 秒对连接错误毫无意义）
-			if fastRetries < 2 {
-				fastRetries++
+			fastRetries++
+			if fastRetries > maxTransportRetries {
+				// 上游持续不可达：明确放弃并返回 502，避免无限重试占满连接与日志
+				log.Printf("[upstream retry exhausted] api=%s upstream=%s model=%s proxy=%s attempts=%d err=%v", clientAPI, effectiveUpstreamName(upstreamName), modelID, proxyLabel, fastRetries, err)
+				stopRec := usageRecorderFromContext(ctx)
+				stopRec.SetStatus(http.StatusBadGateway)
+				stopRec.SetError("upstream unreachable")
+				return nil, http.StatusBadGateway, nil, fmt.Errorf("upstream unreachable after %d attempts: %w", fastRetries, err)
+			}
+			if fastRetries <= 2 {
 				log.Printf("[upstream fast-retry] api=%s upstream=%s model=%s proxy=%s err=%v (第%d次,0ms 立即重试)", clientAPI, effectiveUpstreamName(upstreamName), modelID, proxyLabel, err, fastRetries)
 			} else if err := waitForRetry(ctx, retryDelay); err != nil {
 				return nil, 0, nil, err
@@ -4274,8 +4327,16 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 		resp, err := c.Do(up)
 		if err != nil {
 			// 传输级错误（拨号失败/连接被重置/代理抖动等）：等 1 秒毫无意义，前两次 0ms 立即重试
-			if fastRetries < 2 {
-				fastRetries++
+			fastRetries++
+			if fastRetries > maxTransportRetries {
+				// 上游持续不可达：明确放弃并返回 502，避免无限重试占满连接与日志
+				log.Printf("[upstream retry exhausted] api=%s upstream=%s model=%s proxy=%s attempts=%d err=%v", clientAPI, effectiveUpstreamName(upstreamName), modelID, proxyLabel, fastRetries, err)
+				stopRec := usageRecorderFromContext(ctx)
+				stopRec.SetStatus(http.StatusBadGateway)
+				stopRec.SetError("upstream unreachable")
+				return nil, http.StatusBadGateway, nil, fmt.Errorf("upstream unreachable after %d attempts: %w", fastRetries, err)
+			}
+			if fastRetries <= 2 {
 				log.Printf("[upstream fast-retry] api=%s upstream=%s model=%s proxy=%s err=%v (第%d次,0ms 立即重试)", clientAPI, effectiveUpstreamName(upstreamName), modelID, proxyLabel, err, fastRetries)
 			} else if err := waitForRetry(ctx, retryDelay); err != nil {
 				return nil, 0, nil, err
@@ -5129,11 +5190,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	r = withUsageRecorder(r, rec)
 	resolvedModel, modelAliasInfo, upstreamName, upstream := resolveModel(req.Model)
 	if !isKnownAlias(req.Model) {
+		rec.SetStatus(http.StatusBadRequest)
+		rec.SetError("model not found")
 		http.Error(w, `{"error":{"message":"model not found; only configured aliases are accepted","type":"invalid_request_error"}}`, http.StatusBadRequest)
 		return
 	}
 	req.Model = resolvedModel
 	if req.Model == "" {
+		rec.SetStatus(http.StatusBadRequest)
+		rec.SetError("model is required")
 		http.Error(w, `{"error":"model is required"}`, http.StatusBadRequest)
 		return
 	}
@@ -5145,6 +5210,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	req.Messages, toolArgsErr = normalizeMessagesToolCallArguments(req.Messages)
 	if toolArgsErr != nil {
 		log.Printf("[request invalid] path=/v1/chat/completions model=%q err=%v", req.Model, toolArgsErr)
+		rec.SetStatus(http.StatusBadRequest)
+		rec.SetError(toolArgsErr.Error())
 		http.Error(w, toolArgsErr.Error(), http.StatusBadRequest)
 		return
 	}
@@ -9163,7 +9230,7 @@ if(k==='targets')return '<td title="'+esc((r.targets||[]).join(', '))+'">'+uTags
 if(k==='time')return '<td class="'+(first?'pin ':'')+'num">'+fmtTime(r.ts)+'</td>';
 if(k==='api')return '<td>'+(r.api?esc(r.api):'<span class="u-mut">—</span>')+'</td>';
 if(k==='stream')return '<td class="num">'+(r.stream?'<span class="u-pill ok">流</span>':'<span class="u-mut">—</span>')+'</td>';
-if(k==='status'){var ok=!r.status||(r.status>=200&&r.status<300);var t=r.error?' title="'+esc(r.error)+'"':'';return '<td class="num"'+t+'><span class="u-pill '+(ok?'ok':'bad')+'">'+(ok?(r.status||200):r.status)+'</span></td>'}
+if(k==='status'){var st=r.status||0;var ok=st>=200&&st<300;var t=r.error?' title="'+esc(r.error)+'"':(ok?'':' title="未收到上游响应（超时/断开/请求被拒）"');return '<td class="num"'+t+'><span class="u-pill '+(ok?'ok':'bad')+'">'+(ok?st:(st?st:'无响应'))+'</span></td>'}
 if(k==='succ'){var req=r.requests||0;var err=r.error_count||0;return '<td class="num">'+(req?(((req-err)/req)*100).toFixed(1)+'%':'—')+'</td>'}
 if(k==='errors'){v=r.error_count||0;return '<td class="num">'+(v?'<span class="u-bad">'+fmt(v)+'</span>':'<span class="u-mut">0</span>')+'</td>'}
 if(k==='cache_hit_rate'){v=r.cache_hit_rate||0;return '<td class="num">'+(v>0?v.toFixed(1)+'%':'<span class="u-mut">—</span>')+'</td>'}
