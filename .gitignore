@@ -5,6 +5,10 @@ config.json
 *.local.json
 .env
 .env.*
+# WorkBuddy 账号凭证目录（含明文 access/refresh token）
+auths/
+workbuddy-auths/
+wb-login-state-*.json
 
 # ---------- 本机专用笔记（记录本地网络/代理约束，对他人无价值）----------
 PROXY-NOTES.md

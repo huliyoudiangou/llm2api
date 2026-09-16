@@ -664,8 +664,27 @@ func sameUpstreamConfig(a, b *UpstreamConfig) bool {
 		a.APIKey == b.APIKey &&
 		a.APIType == b.APIType &&
 		a.ResponsesReasoningFormat == b.ResponsesReasoningFormat &&
+		a.WBAuthDir == b.WBAuthDir &&
+		a.WBRealm == b.WBRealm &&
+		a.WBMaxInFlight == b.WBMaxInFlight &&
+		a.WBPromptMode == b.WBPromptMode &&
+		a.WBPromptText == b.WBPromptText &&
+		a.WBPromptFile == b.WBPromptFile &&
+		a.WBCheckin == b.WBCheckin &&
+		a.WBUserAgent == b.WBUserAgent &&
+		a.WBClientVersion == b.WBClientVersion &&
+		a.WBCliVersion == b.WBCliVersion &&
+		a.WBClientName == b.WBClientName &&
+		a.WBDeviceToken == b.WBDeviceToken &&
+		a.WBChatBaseCN == b.WBChatBaseCN &&
+		a.WBChatBaseGlobal == b.WBChatBaseGlobal &&
+		wbSanitizeFlag(a) == wbSanitizeFlag(b) &&
 		sameStringSlice(a.CustomModels, b.CustomModels) &&
 		sameStringMap(a.CustomHeaders, b.CustomHeaders)
+}
+
+func wbSanitizeFlag(cfg *UpstreamConfig) bool {
+	return cfg == nil || cfg.WBSanitize == nil || *cfg.WBSanitize
 }
 
 func sameStringMap(a, b map[string]string) bool {
@@ -704,6 +723,25 @@ func normalizeSingleUpstream(cfg *UpstreamConfig) bool {
 	if cfg.APIType == "" {
 		cfg.APIType = UpstreamOpenAI
 	}
+	if cfg.APIType == UpstreamWorkBuddy {
+		// WorkBuddy 上游的端点由内置 chat base 决定，base_url 可选；
+		// 账号在 wb_auth_dir 凭证目录（默认 auths），不依赖 api_key。
+		cfg.WBAuthDir = strings.TrimSpace(cfg.WBAuthDir)
+		if cfg.WBAuthDir == "" {
+			cfg.WBAuthDir = "auths"
+		}
+		if cfg.WBMaxInFlight <= 0 {
+			cfg.WBMaxInFlight = 3
+		}
+		cfg.WBPromptMode = strings.ToLower(strings.TrimSpace(cfg.WBPromptMode))
+		if cfg.WBPromptMode != "custom" {
+			cfg.WBPromptMode = "passthrough"
+		}
+		cfg.WBRealm = strings.ToLower(strings.TrimSpace(cfg.WBRealm))
+		if cfg.WBRealm != "cn" && cfg.WBRealm != "global" {
+			cfg.WBRealm = "all"
+		}
+	}
 	cfg.ResponsesReasoningFormat = strings.TrimSpace(cfg.ResponsesReasoningFormat)
 	if len(cfg.CustomModels) > 0 {
 		cleaned := make([]string, 0, len(cfg.CustomModels))
@@ -731,7 +769,7 @@ func normalizeSingleUpstream(cfg *UpstreamConfig) bool {
 			cfg.CustomHeaders = nil
 		}
 	}
-	return cfg.BaseURL != ""
+	return cfg.BaseURL != "" || cfg.APIType == UpstreamWorkBuddy
 }
 
 func sortedUpstreamNames(m map[string]*UpstreamConfig) []string {
@@ -814,7 +852,7 @@ func getFirstConfiguredSocks5ProxyAddr() string {
 }
 
 func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, error) {
-	if cfg == nil || cfg.BaseURL == "" {
+	if cfg == nil || (cfg.BaseURL == "" && cfg.APIType != UpstreamWorkBuddy) {
 		return []ModelInfo{}, nil
 	}
 	ownedBy := effectiveUpstreamName(name)
@@ -825,6 +863,10 @@ func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, err
 			models = append(models, ModelInfo{ID: m, Object: "model", Created: now, OwnedBy: ownedBy})
 		}
 		return models, nil
+	}
+	// WorkBuddy：动态探测账号可服务的模型（1h 缓存，失败回静态名单）
+	if cfg.APIType == UpstreamWorkBuddy {
+		return wbListModels(name, cfg)
 	}
 	endpoint := getUpstreamModelsEndpoint(cfg)
 	if cfg.APIType == UpstreamAnthropic && !strings.Contains(endpoint, "limit=") {
@@ -944,10 +986,11 @@ func truncateForLog(s string, limit int) string {
 
 // emptyCustomModelUpstreams 返回 normalize 后 custom_models 仍为空的上游名（已按名排序）。
 // 仅统计 normalize 后保留下来的上游（有名字、有 BaseURL）；custom_models 是模型唯一来源，留空视为未配好。
+// WorkBuddy 上游例外：custom_models 留空表示动态探测账号可服务模型，属合法配置。
 func emptyCustomModelUpstreams(m map[string]*UpstreamConfig) []string {
 	var empty []string
 	for _, name := range sortedUpstreamNames(m) {
-		if cfg := m[name]; cfg != nil && cfg.BaseURL != "" && len(cfg.CustomModels) == 0 {
+		if cfg := m[name]; cfg != nil && cfg.BaseURL != "" && cfg.APIType != UpstreamWorkBuddy && len(cfg.CustomModels) == 0 {
 			empty = append(empty, name)
 		}
 	}
@@ -1403,6 +1446,7 @@ const (
 	UpstreamOpenAI    UpstreamType = "openai"
 	UpstreamAnthropic UpstreamType = "anthropic"
 	UpstreamResponses UpstreamType = "openai-responses"
+	UpstreamWorkBuddy UpstreamType = "workbuddy"
 )
 
 type UpstreamConfig struct {
@@ -1412,6 +1456,23 @@ type UpstreamConfig struct {
 	CustomModels             []string          `json:"custom_models,omitempty"`
 	ResponsesReasoningFormat string            `json:"responses_reasoning_format,omitempty"`
 	CustomHeaders            map[string]string `json:"custom_headers,omitempty"`
+
+	// —— WorkBuddy（api_type=workbuddy）专属；其他类型忽略 ——
+	WBAuthDir        string `json:"wb_auth_dir,omitempty"`         // 凭证目录，默认 auths（相对 config 所在目录）
+	WBRealm          string `json:"wb_realm,omitempty"`            // 账号域过滤：all/cn/global，默认 all
+	WBMaxInFlight    int    `json:"wb_max_in_flight,omitempty"`    // 单账号最大在途请求，默认 3
+	WBPromptMode     string `json:"wb_prompt_mode,omitempty"`      // passthrough（默认，透传客户端 system）/ custom（网关自有提示词替换）
+	WBPromptText     string `json:"wb_prompt_text,omitempty"`      // custom 模式提示词（内联优先）
+	WBPromptFile     string `json:"wb_prompt_file,omitempty"`      // custom 模式提示词文件路径
+	WBSanitize       *bool  `json:"wb_sanitize,omitempty"`         // 指纹脱敏开关，默认 true
+	WBCheckin        bool   `json:"wb_checkin,omitempty"`          // CN 账号每日自动签到
+	WBUserAgent      string `json:"wb_user_agent,omitempty"`       // 显式覆盖出站 UA
+	WBClientVersion  string `json:"wb_client_version,omitempty"`   // WorkBuddy 客户端版本段
+	WBCliVersion     string `json:"wb_cli_version,omitempty"`      // UA CLI 版本段
+	WBClientName     string `json:"wb_client_name,omitempty"`      // 用量归属头取值（如 "WorkBuddy"）
+	WBDeviceToken    string `json:"wb_device_token,omitempty"`     // X-Device-Token 头取值
+	WBChatBaseCN     string `json:"wb_chat_base_cn,omitempty"`     // 覆盖 CN chat base
+	WBChatBaseGlobal string `json:"wb_chat_base_global,omitempty"` // 覆盖 Global chat base
 }
 
 type AppConfig struct {
@@ -1427,6 +1488,7 @@ type ModelAlias struct {
 	Upstream      string `json:"upstream,omitempty"`
 	Socks5Proxy   string `json:"socks5_proxy,omitempty"`
 	WithReasoning bool   `json:"with_reasoning,omitempty"`
+	SystemPrompt  string `json:"system_prompt,omitempty"`
 }
 
 // ======================== Anthropic Messages API 类型 ========================
@@ -1529,6 +1591,16 @@ type ReasonEffort struct {
 
 // ======================== 配置管理 ========================
 
+// utf8BOM Windows 记事本 / PowerShell -Encoding utf8 等编辑器保存文件时可能写入的 UTF-8 BOM。
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// stripBOM 剥离文件开头的 UTF-8 BOM。encoding/json 不接受 BOM 前缀（invalid character 'ï'），
+// 此前任何被编辑器加了 BOM 的配置文件都会被误判为"损坏"并备份改名——对记事本保存的用户
+// 等于凭空丢配置。BOM 无害且剥离无副作用，统一在读入时剥掉。
+func stripBOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, utf8BOM)
+}
+
 // loadConfig 读取配置。返回值 ok=false 表示文件存在但解析失败（已把原件备份为 *.bad-*），
 // 调用方不应再用空配置覆盖写回，否则会销毁用户唯一的配置原件。
 func loadConfig(path string) (cfg AppConfig, ok bool) {
@@ -1541,7 +1613,7 @@ func loadConfig(path string) (cfg AppConfig, ok bool) {
 		normalizeConfig(&cfg)
 		return cfg, false
 	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	if err := json.Unmarshal(stripBOM(data), &cfg); err != nil {
 		backup := backupCorruptFile(path)
 		if backup != "" {
 			log.Printf("警告: 配置文件解析失败: %v", err)
@@ -1565,6 +1637,7 @@ func normalizeConfig(cfg *AppConfig) {
 		alias.TargetModel = strings.TrimSpace(alias.TargetModel)
 		alias.Upstream = strings.TrimSpace(alias.Upstream)
 		alias.Socks5Proxy = strings.TrimSpace(alias.Socks5Proxy)
+		alias.SystemPrompt = strings.TrimSpace(alias.SystemPrompt)
 		if trimmedKey == "" {
 			delete(cfg.ModelAlias, key)
 			continue
@@ -1672,6 +1745,7 @@ func applyConfig(cfg AppConfig) bool {
 		clearModelKeyAffinity()
 	}
 	clearSocks5ClientCache()
+	wbApplyConfig(cfg.Upstreams, upstreamsChanged)
 
 	return upstreamsChanged
 }
@@ -1754,7 +1828,7 @@ func loadTokenStats() {
 		return
 	}
 	var st TokenStatsData
-	if err := json.Unmarshal(data, &st); err != nil {
+	if err := json.Unmarshal(stripBOM(data), &st); err != nil {
 		// 损坏的统计文件改名留证；否则首次保存就会把仅存的原件覆盖掉
 		backup := backupCorruptFile(tokenStatsPath)
 		if backup != "" {
@@ -1987,7 +2061,7 @@ func loadPricing() {
 		return
 	}
 	var p PricingConfig
-	if err := json.Unmarshal(data, &p); err != nil {
+	if err := json.Unmarshal(stripBOM(data), &p); err != nil {
 		log.Printf("[统计] pricing.json 解析失败，忽略费用估算: %v", err)
 		return
 	}
@@ -3508,6 +3582,90 @@ func ensureReasoningContent(messages []Message, withReasoning bool) []Message {
 	return messages
 }
 
+// ======================== 别名角色提示（system_prompt）注入 ========================
+
+// injectSystemPrompt 将别名配置的角色提示注入消息列表：
+// 已存在 system 消息则把提示合并到其最前面，否则在列表最前新增一条 system 消息。
+// prompt 为空时原样返回，保持默认行为。
+func injectSystemPrompt(messages []Message, prompt string) []Message {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return messages
+	}
+	for i := range messages {
+		if messages[i].Role != "system" {
+			continue
+		}
+		messages[i].Content = mergeSystemPromptText(messages[i].Content, prompt)
+		return messages
+	}
+	return append([]Message{{Role: "system", Content: prompt}}, messages...)
+}
+
+// mergeSystemPromptText 把配置的角色提示合并到已有 system 内容的最前面，
+// 支持字符串与 multi-part 数组两种内容形态；不修改原切片中的 map。
+func mergeSystemPromptText(existing any, prompt string) any {
+	switch v := existing.(type) {
+	case nil:
+		return prompt
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return prompt
+		}
+		return prompt + "\n" + v
+	case []any:
+		out := make([]any, 0, len(v)+1)
+		merged := false
+		for _, part := range v {
+			if !merged {
+				if p, ok := part.(map[string]any); ok {
+					if txt, ok := p["text"].(string); ok {
+						cp := make(map[string]any, len(p)+1)
+						for k, val := range p {
+							cp[k] = val
+						}
+						cp["text"] = prompt + "\n" + txt
+						out = append(out, cp)
+						merged = true
+						continue
+					}
+				}
+			}
+			out = append(out, part)
+		}
+		if !merged {
+			out = append([]any{map[string]any{"type": "text", "text": prompt}}, out...)
+		}
+		return out
+	default:
+		return prompt + "\n" + fmt.Sprintf("%v", v)
+	}
+}
+
+// injectAnthropicSystemPrompt 将别名角色提示合并进 Anthropic 请求的 system 字段
+// （字符串或 block 数组），供 Anthropic 同协议透传路径使用。
+func injectAnthropicSystemPrompt(req map[string]any, prompt string) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return
+	}
+	sys, ok := req["system"]
+	if !ok || sys == nil {
+		req["system"] = prompt
+		return
+	}
+	switch v := sys.(type) {
+	case string:
+		if strings.TrimSpace(v) == "" {
+			req["system"] = prompt
+		} else {
+			req["system"] = prompt + "\n" + v
+		}
+	case []any:
+		req["system"] = mergeSystemPromptText(v, prompt)
+	}
+}
+
 func convertMessagesForUpstream(messages []Message, withReasoning bool) []map[string]any {
 	converted := make([]map[string]any, 0, len(messages))
 	for _, msg := range messages {
@@ -4344,8 +4502,12 @@ func prepareOpenAIUpstreamBody(reqBody []byte, modelID string, upstream *Upstrea
 }
 
 func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, rawResponse ...bool) ([]byte, int, http.Header, error) {
-	if upstream == nil || upstream.BaseURL == "" {
+	if upstream == nil || (upstream.BaseURL == "" && upstream.APIType != UpstreamWorkBuddy) {
 		return nil, 500, nil, fmt.Errorf("upstream not configured")
+	}
+	// WorkBuddy 上游：端点/鉴权/改写由 wb 子系统接管（账号池轮转 + 强制流式 + 本地聚合）。
+	if upstream.APIType == UpstreamWorkBuddy {
+		return wbCallUpstream(ctx, preparedBody, upstreamName, modelID, clientAPI, upstream, proxyAddr)
 	}
 
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream, modelID)
@@ -4499,8 +4661,12 @@ func callUpstream(ctx context.Context, reqBody []byte, upstreamName, modelID, cl
 }
 
 func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string) (io.ReadCloser, int, http.Header, error) {
-	if upstream == nil || upstream.BaseURL == "" {
+	if upstream == nil || (upstream.BaseURL == "" && upstream.APIType != UpstreamWorkBuddy) {
 		return nil, 500, nil, fmt.Errorf("upstream not configured")
+	}
+	// WorkBuddy 上游：账号池轮转 + 强制流式 + SSE 帧规范化（工具名回填/统一 [DONE]）。
+	if upstream.APIType == UpstreamWorkBuddy {
+		return wbCallUpstreamStream(ctx, preparedBody, upstreamName, modelID, clientAPI, upstream, proxyAddr)
 	}
 
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream, modelID)
@@ -4776,7 +4942,7 @@ func addAnthropicSystemCacheControl(req map[string]any) {
 	}
 }
 
-func prepareAnthropicPassthroughBody(body []byte, modelID string) ([]byte, error) {
+func prepareAnthropicPassthroughBody(body []byte, modelID string, systemPrompt ...string) ([]byte, error) {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, err
@@ -4785,7 +4951,12 @@ func prepareAnthropicPassthroughBody(body []byte, modelID string) ([]byte, error
 	if err := normalizeRawMessagesToolCallArguments(req["messages"]); err != nil {
 		return nil, err
 	}
+	// 别名角色提示：合并进 system 字段（字符串或 block 数组），不填则原样透传
+	if len(systemPrompt) > 0 {
+		injectAnthropicSystemPrompt(req, systemPrompt[0])
+	}
 	// Anthropic 同协议透传时自动标记 user 消息的 cache_control，提升上游 prefix cache 命中。
+	// 在角色提示注入之后执行，保证新合并的 system 也能打上 cache 断点。
 	if msgs, ok := req["messages"].([]any); ok {
 		addAnthropicCacheControlToRaw(msgs)
 	}
@@ -4893,7 +5064,9 @@ func proxyAnthropicPassthroughStream(w http.ResponseWriter, body io.ReadCloser, 
 func prepareResponsesPassthroughBody(body []byte, modelID string, alias ModelAlias) ([]byte, error) {
 	// Responses 同协议快速透传：仅替换顶层 model，并补齐 stream_options.include_usage。
 	// 对不含 tool_calls / 计费头清洗需求的请求，跳过 Unmarshal/Marshal。
-	if !bytes.Contains(body, []byte(`"tool_calls"`)) &&
+	// 配置了 system_prompt（角色提示）的别名必须走完整路径注入 instructions。
+	if strings.TrimSpace(alias.SystemPrompt) == "" &&
+		!bytes.Contains(body, []byte(`"tool_calls"`)) &&
 		!bytes.Contains(body, []byte(`"function_call"`)) &&
 		!bytes.Contains(body, []byte(`"x-anthropic-billing-header"`)) {
 		if out, err := replaceTopLevelModelString(body, modelID); err == nil {
@@ -4919,6 +5092,15 @@ func prepareResponsesPassthroughBody(body []byte, modelID string, alias ModelAli
 	}
 	stripBillingHeaderFromResponsesItems(req["input"])
 	stripBillingHeaderFromResponsesItems(req["messages"])
+	// 别名角色提示：合并进 instructions 字段（Responses 协议没有 system 消息），
+	// 不填则保持原样。
+	if prompt := strings.TrimSpace(alias.SystemPrompt); prompt != "" {
+		if existing, ok := req["instructions"].(string); ok && strings.TrimSpace(existing) != "" {
+			req["instructions"] = prompt + "\n" + existing
+		} else {
+			req["instructions"] = prompt
+		}
+	}
 	ensureResponsesIncludeUsage(req)
 
 	return json.Marshal(req)
@@ -5345,6 +5527,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 同协议 OpenAI Chat 快速透传：只替换顶层 model，不重建 messages，最大化保留上游缓存前缀。
 	// 仅用于没有历史 tool_calls/reasoning/extra_body 这类需要网关归一化的简单请求。
+	// 配置了 system_prompt（角色提示）的别名必须走完整转换路径注入 system 消息。
 	if rawModel := extractTopLevelModelString(body); rawModel != "" {
 		_, rawAlias, rawUpstreamName, rawUpstream := resolveModel(rawModel)
 		if isKnownAlias(rawModel) && rawUpstream != nil && rawUpstream.APIType == UpstreamOpenAI &&
@@ -5352,6 +5535,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			!bytes.Contains(body, []byte(`"tool_calls"`)) &&
 			!bytes.Contains(body, []byte(`"reasoning_content"`)) &&
 			!bytes.Contains(body, []byte(`"extra_body"`)) &&
+			strings.TrimSpace(rawAlias.SystemPrompt) == "" &&
 			// 部分 OpenAI 兼容上游不接受 developer 角色；遇到时回退完整转换，
 			// 让 convertMessagesForUpstream 将 developer 降级为 system。
 			!bytes.Contains(body, []byte(`"role":"developer"`)) &&
@@ -5447,6 +5631,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, toolArgsErr.Error(), http.StatusBadRequest)
 		return
 	}
+	// 别名角色提示：优先于客户端消息注入，客户端 system 内容合并在其后
+	req.Messages = injectSystemPrompt(req.Messages, modelAliasInfo.SystemPrompt)
 	ensureReasoningEffort(&req, modelAliasInfo)
 	req.Messages = ensureReasoningContent(req.Messages, modelAliasInfo.WithReasoning)
 	upstreamBody := buildUpstreamBody(&req, modelAliasInfo.WithReasoning)
@@ -6045,7 +6231,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 上游是 Anthropic 类型时，下游入口与上游同为 Anthropic 协议，直接透传
 	if upstream != nil && upstream.APIType == UpstreamAnthropic {
-		rawBody, err := prepareAnthropicPassthroughBody(body, anthropicReq.Model)
+		rawBody, err := prepareAnthropicPassthroughBody(body, anthropicReq.Model, modelAliasInfo.SystemPrompt)
 		if err != nil {
 			log.Printf("[request invalid] path=/v1/messages mode=passthrough model=%q err=%v", anthropicReq.Model, err)
 			w.Header().Set("Content-Type", "application/json")
@@ -6125,6 +6311,8 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request_error", "message": toolArgsErr.Error()}})
 		return
 	}
+	// 别名角色提示：优先于客户端消息注入，客户端 system 内容合并在其后
+	messages = injectSystemPrompt(messages, modelAliasInfo.SystemPrompt)
 
 	chatReq := OpenAIRequest{
 		Model:    anthropicReq.Model,
@@ -7454,6 +7642,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	} else if respReq.Instructions != "" {
 		messages = append([]Message{{Role: "system", Content: respReq.Instructions}}, messages...)
 	}
+	// 别名角色提示：优先于客户端消息注入，客户端 system 内容合并在其后
+	messages = injectSystemPrompt(messages, modelAliasInfo.SystemPrompt)
 
 	chatReq := OpenAIRequest{
 		Model:    respReq.Model,
@@ -8333,13 +8523,13 @@ func upstreamModelsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_, up := resolveUpstream(name)
-		if up == nil || up.BaseURL == "" {
+		if up == nil || (up.BaseURL == "" && up.APIType != UpstreamWorkBuddy) {
 			http.Error(w, "upstream not found", http.StatusNotFound)
 			return
 		}
 		probe = cloneUpstreamConfig(up)
 	}
-	if probe.BaseURL == "" {
+	if probe.BaseURL == "" && probe.APIType != UpstreamWorkBuddy {
 		http.Error(w, "missing base_url", http.StatusBadRequest)
 		return
 	}
@@ -9130,6 +9320,7 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .upstream-field textarea{min-height:92px;resize:vertical;line-height:1.45}
 .upstream-field input:focus,.upstream-field textarea:focus,.upstream-field select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
 .upstream-field .field-hint{margin-top:4px;color:var(--text-ter);font-size:10.5px}
+.upstream-field .field-check{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text);margin-right:14px;cursor:pointer}
 .upstream-item-actions{display:flex;justify-content:flex-end;margin-top:14px;padding-top:12px;border-top:1px solid var(--border)}
 .custom-models-row{display:flex;gap:8px}
 .custom-models-row input{flex:1;min-width:0}
@@ -9291,11 +9482,32 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 <div class="upstream-list" id="upstreamList"></div>
 </div>
+<div class="card full-row" id="wbCard" style="display:none">
+<div class="panel-header">
+<h2><span class="dot" style="background:#e8a33d"></span>WorkBuddy 账号池</h2>
+<div class="btns">
+<select id="wbLoginRealm" style="min-width:110px"><option value="cn">国内版 (cn)</option><option value="global">国际版 (global)</option></select>
+<select id="wbLoginProxy" style="min-width:120px"><option value="">直连</option></select>
+<button class="btn btn-primary" id="wbLoginBtn" onclick="wbStartLogin()">浏览器登录</button>
+<button class="btn btn-secondary" onclick="wbCheckinNow()">手动签到</button>
+<button class="btn btn-secondary" onclick="wbRenderStatus()">刷新状态</button>
+</div>
+</div>
+<div class="field-hint" style="margin-bottom:10px">登录由本面板发起、网关服务器自动接管授权结果（打开的浏览器标签页可关闭，不影响入库）。新账号入库后即时生效（账号池热加载），无需重启。冷却状态为内存态，重启后清零。</div>
+<div id="wbLoginBox" style="display:none;margin-bottom:12px;padding:10px 12px;border:1px dashed #e8a33d;border-radius:8px;font-size:12.5px">
+<div id="wbLoginStatus"></div>
+<div id="wbLoginLink" style="margin-top:6px;word-break:break-all"></div>
+</div>
+<table class="tbl" id="wbStatusTable">
+<thead><tr><th style="width:16%">上游</th><th style="width:14%">UID</th><th style="width:12%">昵称</th><th style="width:8%">域</th><th style="width:10%">状态</th><th style="width:16%">Token 到期</th><th style="width:24%">冷却 / 备注</th></tr></thead>
+<tbody><tr><td colspan="7" style="color:var(--text-ter)">加载中…</td></tr></tbody>
+</table>
+</div>
 <div class="card full-row">
 <h2><span class="dot" style="background:var(--accent)"></span>模型映射</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="aliasTable">
-<thead><tr><th style="width:17%">别名（请求名）</th><th style="width:14%">上游</th><th style="width:24%">实际模型（上游名）</th><th style="width:18%">代理出口</th><th style="width:19%">回传 reasoning_content</th><th style="width:8%"></th></tr></thead>
+<thead><tr><th style="width:14%">别名（请求名）</th><th style="width:12%">上游</th><th style="width:18%">实际模型（上游名）</th><th style="width:14%">代理出口</th><th style="width:14%">回传 reasoning</th><th style="width:20%">角色提示（可选）</th><th style="width:8%"></th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
@@ -9335,37 +9547,50 @@ let aliasData={},effortData={},modelListByUpstream={},upstreamData={},socks5Data
 function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadUsage();setTimeout(()=>window.scrollTo(0,sy),100)})}
-function apiTypeSelectHtml(selected){const v=selected||'openai';return '<select data-field="api_type" onchange="onUpstreamTypeChange(this)"><option value="openai"'+(v==='openai'?' selected':'')+'>OpenAI</option><option value="anthropic"'+(v==='anthropic'?' selected':'')+'>Anthropic</option><option value="openai-responses"'+(v==='openai-responses'?' selected':'')+'>Responses</option></select>'}
-function upstreamTypeLabel(value){if(value==='anthropic')return 'Anthropic';if(value==='openai-responses')return 'Responses';return 'OpenAI'}
+function apiTypeSelectHtml(selected){const v=selected||'openai';return '<select data-field="api_type" onchange="onUpstreamTypeChange(this)"><option value="openai"'+(v==='openai'?' selected':'')+'>OpenAI</option><option value="anthropic"'+(v==='anthropic'?' selected':'')+'>Anthropic</option><option value="openai-responses"'+(v==='openai-responses'?' selected':'')+'>Responses</option><option value="workbuddy"'+(v==='workbuddy'?' selected':'')+'>WorkBuddy</option></select>'}
+function upstreamTypeLabel(value){if(value==='anthropic')return 'Anthropic';if(value==='openai-responses')return 'Responses';if(value==='workbuddy')return 'WorkBuddy';return 'OpenAI'}
 function nonEmptyLineCount(value){return String(value||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean).length}
 function customModelCount(value){return String(value||'').split(',').map(s=>s.trim()).filter(Boolean).length}
 function responsesReasoningFormatHtml(value){const legacy=['reasoning_effort','legacy','legacy_reasoning_effort'].includes(value);return '<select data-field="responses_reasoning_format"><option value=""'+(!legacy?' selected':'')+'>标准 reasoning.effort</option><option value="legacy_reasoning_effort"'+(legacy?' selected':'')+'>兼容 reasoning_effort</option></select>'}
 function customHeadersToText(obj){obj=obj||{};return Object.keys(obj).map(k=>k+': '+obj[k]).join('\n')}
 function headerLineCount(text){return String(text||'').split(/\r?\n/).map(s=>s.trim()).filter(s=>s&&s.indexOf(':')>0).length}
 function parseHeaderText(text){const r={};String(text||'').split(/\r?\n/).forEach(line=>{const t=line.trim();if(!t)return;const i=t.indexOf(':');if(i<=0)return;const k=t.slice(0,i).trim();const v=t.slice(i+1).trim();if(k)r[k]=v});return r}
-function upstreamCardHtml(name,up,expanded){up=up||{};const apiType=up.api_type||'openai';const baseURL=up.base_url||'';const apiKey=up.api_key||'';const customModels=(up.custom_models||[]).join(',');const headersText=customHeadersToText(up.custom_headers);const headerCount=Object.keys(up.custom_headers||{}).length;const keyCount=nonEmptyLineCount(apiKey);const modelCount=(up.custom_models||[]).length;let h='<details class="upstream-item" data-original-name="'+esc(name||'')+'"'+(expanded?' open':'')+'>';h+='<summary><span class="upstream-summary-name">'+esc(name||'未命名上游')+'</span><span class="upstream-type-badge">'+upstreamTypeLabel(apiType)+'</span><span class="upstream-summary-url">'+esc(baseURL||'尚未配置 Base URL')+'</span><span class="upstream-summary-meta">'+keyCount+' Key · '+modelCount+' 模型'+(headerCount>0?' · '+headerCount+' 请求头':'')+'</span></summary>';h+='<div class="upstream-body"><div class="upstream-form-grid">';h+='<div class="upstream-field"><label>名称</label><input value="'+esc(name||'')+'" data-field="name" placeholder="例如: main" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field"><label>接口类型</label>'+apiTypeSelectHtml(apiType)+'</div>';h+='<div class="upstream-field full"><label>Base URL</label><input value="'+esc(baseURL)+'" data-field="base_url" placeholder="https://example.com/v1" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field full"><label>API Key（每行一个）</label><textarea data-field="api_key" placeholder="每行填写一个 API Key" oninput="updateUpstreamCardSummary(this)">'+esc(apiKey)+'</textarea><div class="field-hint">支持填写多个 Key，请求时按顺序轮询。</div></div>';h+='<div class="upstream-field full"><label>自定义请求头（每行一条）</label><textarea data-field="custom_headers" placeholder="X-Custom-Header: value">'+esc(headersText)+'</textarea><div class="field-hint">每行一条，格式 "名称: 值"；发往该上游的所有请求都会附加，同名头覆盖网关默认头（如 Authorization、anthropic-version）。</div></div>';h+='<div class="upstream-field full"><label>自定义模型</label><div class="custom-models-row"><input value="'+esc(customModels)+'" data-field="custom_models" placeholder="model-a, model-b" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"><button type="button" class="btn btn-secondary" onclick="fetchUpstreamModels(this)">获取模型列表</button></div><div class="field-hint">多个模型使用英文逗号分隔；点"获取模型列表"从上游 /models 实时拉取并填入；填入后启动/刷新不再自动拉取。</div></div>';h+='<div class="upstream-field full responses-format-field"'+(apiType==='openai-responses'?'':' style="display:none"')+'><label>Responses 推理参数格式</label>'+responsesReasoningFormatHtml(up.responses_reasoning_format||'')+'</div>';h+='</div><div class="upstream-item-actions"><button class="btn btn-danger" onclick="delUpstream(this)">删除此上游</button></div></div></details>';return h}
+function upstreamCardHtml(name,up,expanded){up=up||{};const apiType=up.api_type||'openai';const baseURL=up.base_url||'';const apiKey=up.api_key||'';const customModels=(up.custom_models||[]).join(',');const headersText=customHeadersToText(up.custom_headers);const headerCount=Object.keys(up.custom_headers||{}).length;const keyCount=nonEmptyLineCount(apiKey);const modelCount=(up.custom_models||[]).length;const isWB=apiType==='workbuddy';const sumUrl=isWB?esc('账号池 '+(up.wb_auth_dir||'auths')):esc(baseURL||'尚未配置 Base URL');const sumMeta=isWB?(modelCount+' 模型（空=动态探测）'):keyCount+' Key · '+modelCount+' 模型';let h='<details class="upstream-item" data-original-name="'+esc(name||'')+'"'+(expanded?' open':'')+'>';h+='<summary><span class="upstream-summary-name">'+esc(name||'未命名上游')+'</span><span class="upstream-type-badge">'+upstreamTypeLabel(apiType)+'</span><span class="upstream-summary-url">'+sumUrl+'</span><span class="upstream-summary-meta">'+sumMeta+(headerCount>0?' · '+headerCount+' 请求头':'')+'</span></summary>';h+='<div class="upstream-body"><div class="upstream-form-grid">';h+='<div class="upstream-field"><label>名称</label><input value="'+esc(name||'')+'" data-field="name" placeholder="例如: main" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field"><label>接口类型</label>'+apiTypeSelectHtml(apiType)+'</div>';h+='<div class="upstream-field full"><label>Base URL</label><input value="'+esc(baseURL)+'" data-field="base_url" placeholder="https://example.com/v1" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field full"><label>API Key（每行一个）</label><textarea data-field="api_key" placeholder="每行填写一个 API Key" oninput="updateUpstreamCardSummary(this)">'+esc(apiKey)+'</textarea><div class="field-hint">支持填写多个 Key，请求时按顺序轮询。</div></div>';h+='<div class="upstream-field full"><label>自定义请求头（每行一条）</label><textarea data-field="custom_headers" placeholder="X-Custom-Header: value">'+esc(headersText)+'</textarea><div class="field-hint">每行一条，格式 "名称: 值"；发往该上游的所有请求都会附加，同名头覆盖网关默认头（如 Authorization、anthropic-version）。</div></div>';h+='<div class="upstream-field full"><label>自定义模型</label><div class="custom-models-row"><input value="'+esc(customModels)+'" data-field="custom_models" placeholder="model-a, model-b" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"><button type="button" class="btn btn-secondary" onclick="fetchUpstreamModels(this)">获取模型列表</button></div><div class="field-hint">多个模型使用英文逗号分隔；点"获取模型列表"从上游 /models 实时拉取并填入；填入后启动/刷新不再自动拉取。</div></div>';h+='<div class="upstream-field full responses-format-field"'+(apiType==='openai-responses'?'':' style="display:none"')+'><label>Responses 推理参数格式</label>'+responsesReasoningFormatHtml(up.responses_reasoning_format||'')+'</div>';h+='<div class="wb-fields"'+(apiType==='workbuddy'?'':' style="display:none"')+'>';h+='<div class="upstream-field"><label>凭证目录</label><input value="'+esc(up.wb_auth_dir||'auths')+'" data-field="wb_auth_dir" placeholder="auths"></div>';h+='<div class="upstream-field"><label>账号域</label><select data-field="wb_realm"><option value="all"'+((up.wb_realm||'all')==='all'?' selected':'')+'>all（自动）</option><option value="cn"'+(up.wb_realm==='cn'?' selected':'')+'>cn（国内版）</option><option value="global"'+(up.wb_realm==='global'?' selected':'')+'>global（国际版）</option></select></div>';h+='<div class="upstream-field"><label>单号最大在途</label><input type="number" min="1" value="'+(up.wb_max_in_flight||3)+'" data-field="wb_max_in_flight"></div>';h+='<div class="upstream-field"><label>系统提示词模式</label><select data-field="wb_prompt_mode"><option value="passthrough"'+((up.wb_prompt_mode||'passthrough')==='passthrough'?' selected':'')+'>passthrough（透传客户端）</option><option value="custom"'+(up.wb_prompt_mode==='custom'?' selected':'')+'>custom（网关自有提示词）</option></select></div>';h+='<div class="upstream-field full"><label>custom 模式提示词（留空用内置工程助手提示词）</label><textarea data-field="wb_prompt_text" placeholder="自定义 system 提示词…">'+esc(up.wb_prompt_text||'')+'</textarea></div>';h+='<div class="upstream-field full"><label>账号选项</label><label class="field-check"><input type="checkbox" data-field="wb_sanitize"'+(up.wb_sanitize===false?'':' checked')+'> 指纹脱敏（消除 Claude Code/Codex 模板句误报）</label> <label class="field-check"><input type="checkbox" data-field="wb_checkin"'+(up.wb_checkin?' checked':'')+'> 每日自动签到（CN 账号）</label><div class="field-hint">WorkBuddy 账号无需 API Key：到下方「WorkBuddy 账号池」卡片点 <b>浏览器登录</b>，授权完成后自动入库进池（免重启）；命令行兜底：<code>-wb-login=url</code> → 浏览器登录 → <code>-wb-login=poll</code>。模型点"获取模型列表"自动探测（单域上游给裸名；all 混池国际版带 <code>global:</code> 前缀），也可手工填写。</div></div>';h+='</div>';h+='</div><div class="upstream-item-actions"><button class="btn btn-danger" onclick="delUpstream(this)">删除此上游</button></div></div></details>';return h}
 function buildModelListByUpstreamFromCustomModels(){const grouped={};Object.keys(upstreamData).forEach(name=>{const arr=(upstreamData[name]&&Array.isArray(upstreamData[name].custom_models))?upstreamData[name].custom_models:(typeof (upstreamData[name]||{}).custom_models==='string'?(upstreamData[name].custom_models.split(',').map(s=>s.trim()).filter(Boolean)):[]);grouped[name]=Array.from(new Set(arr)).sort()});return grouped}
-function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||'',with_reasoning:!!raw.with_reasoning}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:'',with_reasoning:false}}});aliasData=next}
+function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||'',with_reasoning:!!raw.with_reasoning,system_prompt:raw.system_prompt||''}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:'',with_reasoning:false,system_prompt:''}}});aliasData=next}
 function normalizeUpstreamData(cfg){upstreamData=cfg.upstreams||{}}
 async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();aliasData=cfg.model_alias||{};normalizeAliasData();effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];normalizeUpstreamData(cfg);modelListByUpstream=buildModelListByUpstreamFromCustomModels()
-renderUpstreamTable();renderAliasTable();renderEffortTable();renderSocks5Table();setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
+renderUpstreamTable();renderAliasTable();renderEffortTable();renderSocks5Table();wbRenderLoginUI();setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
 function renderUpstreamTable(){const list=document.getElementById('upstreamList');const names=Object.keys(upstreamData).sort();list.innerHTML=names.length?names.map(name=>upstreamCardHtml(name,upstreamData[name],false)).join(''):'<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';}
 function addUpstreamRow(){collectUpstreams();const list=document.getElementById('upstreamList');const empty=list.querySelector('.upstream-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',upstreamCardHtml('',{api_type:'openai'},true));const cards=list.querySelectorAll('.upstream-item');const input=cards.length?cards[cards.length-1].querySelector('[data-field="name"]'):null;if(input)input.focus()}
 function delUpstream(btn){collectAliases();const card=btn.closest('.upstream-item');if(card)card.remove();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();const list=document.getElementById('upstreamList');if(!list.querySelector('.upstream-item'))list.innerHTML='<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';renderAliasTable()}
-function collectUpstreams(){const r={};document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!name||!baseURL)return;const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const reasoningFormat=(card.querySelector('[data-field="responses_reasoning_format"]')||{}).value||'';const headers=parseHeaderText((card.querySelector('[data-field="custom_headers"]')||{}).value||'');const up={base_url:baseURL,api_type:apiType};if(apiKey)up.api_key=apiKey;if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);if(apiType==='openai-responses'&&reasoningFormat)up.responses_reasoning_format=reasoningFormat;if(Object.keys(headers).length)up.custom_headers=headers;r[name]=up;card.dataset.originalName=name});upstreamData=r;return r}
-function updateUpstreamCardSummary(el){const card=el.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value||'';const headerN=headerLineCount((card.querySelector('[data-field="custom_headers"]')||{}).value||'');card.querySelector('.upstream-summary-name').textContent=name||'未命名上游';card.querySelector('.upstream-summary-url').textContent=baseURL||'尚未配置 Base URL';card.querySelector('.upstream-type-badge').textContent=upstreamTypeLabel(apiType);card.querySelector('.upstream-summary-meta').textContent=nonEmptyLineCount(apiKey)+' Key · '+customModelCount(customRaw)+' 模型'+(headerN>0?' · '+headerN+' 请求头':'')}
-function onUpstreamTypeChange(sel){const card=sel.closest('.upstream-item');const field=card?card.querySelector('.responses-format-field'):null;if(field)field.style.display=sel.value==='openai-responses'?'':'none';updateUpstreamCardSummary(sel)}
-function syncUpstreamOptions(){collectAliases();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();renderAliasTable()}function fetchUpstreamModels(btn){const card=btn.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!baseURL){alert('请先填写 Base URL');return}const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const input=card.querySelector('[data-field="custom_models"]');const body={base_url:baseURL,api_type:apiType};if(apiKey)body.api_key=apiKey;const probeHeaders=parseHeaderText((card.querySelector('[data-field="custom_headers"]')||{}).value||'');if(Object.keys(probeHeaders).length)body.custom_headers=probeHeaders;const orig=btn.textContent;btn.disabled=true;btn.textContent='获取中…';fetch('/api/upstream/models?name='+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>{if(!r.ok){return r.text().then(t=>{throw new Error(t||('HTTP '+r.status))})}return r.json()}).then(d=>{const arr=Array.isArray(d.models)?d.models:[];if(arr.length===0){alert('上游未返回任何模型');return}input.value=arr.join(', ');updateUpstreamCardSummary(input);syncUpstreamOptions();btn.textContent='已填充 '+arr.length+' 个'}).catch(e=>{alert('获取失败: '+(e&&e.message?e.message:e))}).finally(()=>{btn.disabled=false;btn.textContent=orig})}
+function collectUpstreams(){const r={};document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';if(!name)return;if(!baseURL&&apiType!=='workbuddy')return;const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const reasoningFormat=(card.querySelector('[data-field="responses_reasoning_format"]')||{}).value||'';const headers=parseHeaderText((card.querySelector('[data-field="custom_headers"]')||{}).value||'');const up={base_url:baseURL,api_type:apiType};if(apiKey)up.api_key=apiKey;if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);if(apiType==='openai-responses'&&reasoningFormat)up.responses_reasoning_format=reasoningFormat;if(Object.keys(headers).length)up.custom_headers=headers;if(apiType==='workbuddy'){const authDir=(card.querySelector('[data-field="wb_auth_dir"]')||{}).value?.trim()||'';const realm=(card.querySelector('[data-field="wb_realm"]')||{}).value||'all';const mif=parseInt((card.querySelector('[data-field="wb_max_in_flight"]')||{}).value||'',10);const pm=(card.querySelector('[data-field="wb_prompt_mode"]')||{}).value||'passthrough';const pt=(card.querySelector('[data-field="wb_prompt_text"]')||{}).value||'';const sanEl=card.querySelector('[data-field="wb_sanitize"]');const chkEl=card.querySelector('[data-field="wb_checkin"]');if(authDir)up.wb_auth_dir=authDir;if(realm&&realm!=='all')up.wb_realm=realm;if(mif>0)up.wb_max_in_flight=mif;if(pm)up.wb_prompt_mode=pm;if(pt.trim())up.wb_prompt_text=pt;if(sanEl)up.wb_sanitize=!!sanEl.checked;if(chkEl&&chkEl.checked)up.wb_checkin=true}r[name]=up;card.dataset.originalName=name});upstreamData=r;return r}
+function updateUpstreamCardSummary(el){const card=el.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value||'';const headerN=headerLineCount((card.querySelector('[data-field="custom_headers"]')||{}).value||'');const isWB=apiType==='workbuddy';const authDirEl=(card.querySelector('[data-field="wb_auth_dir"]')||{}).value?.trim()||'auths';card.querySelector('.upstream-summary-name').textContent=name||'未命名上游';card.querySelector('.upstream-summary-url').textContent=isWB?('账号池 '+authDirEl):(baseURL||'尚未配置 Base URL');card.querySelector('.upstream-type-badge').textContent=upstreamTypeLabel(apiType);card.querySelector('.upstream-summary-meta').textContent=(isWB?(customModelCount(customRaw)+' 模型（空=动态探测）'):(nonEmptyLineCount(apiKey)+' Key · '+customModelCount(customRaw)+' 模型'))+(headerN>0?' · '+headerN+' 请求头':'')}
+function onUpstreamTypeChange(sel){const card=sel.closest('.upstream-item');const field=card?card.querySelector('.responses-format-field'):null;if(field)field.style.display=sel.value==='openai-responses'?'':'none';const wbf=card?card.querySelector('.wb-fields'):null;if(wbf)wbf.style.display=sel.value==='workbuddy'?'':'none';updateUpstreamCardSummary(sel)}
+function syncUpstreamOptions(){collectAliases();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();renderAliasTable()}function fetchUpstreamModels(btn){const card=btn.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const isWB=apiType==='workbuddy';if(!baseURL&&!isWB){alert('请先填写 Base URL');return}const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const input=card.querySelector('[data-field="custom_models"]');const body={base_url:baseURL,api_type:apiType};if(apiKey)body.api_key=apiKey;if(isWB){const authDir=(card.querySelector('[data-field="wb_auth_dir"]')||{}).value?.trim()||'';const realm=(card.querySelector('[data-field="wb_realm"]')||{}).value||'';if(authDir)body.wb_auth_dir=authDir;if(realm&&realm!=='all')body.wb_realm=realm}const probeHeaders=parseHeaderText((card.querySelector('[data-field="custom_headers"]')||{}).value||'');if(Object.keys(probeHeaders).length)body.custom_headers=probeHeaders;const orig=btn.textContent;btn.disabled=true;btn.textContent='获取中…';fetch('/api/upstream/models?name='+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>{if(!r.ok){return r.text().then(t=>{throw new Error(t||('HTTP '+r.status))})}return r.json()}).then(d=>{const arr=Array.isArray(d.models)?d.models:[];if(arr.length===0){alert('上游未返回任何模型');return}input.value=arr.join(', ');updateUpstreamCardSummary(input);syncUpstreamOptions();btn.textContent='已填充 '+arr.length+' 个'}).catch(e=>{alert('获取失败: '+(e&&e.message?e.message:e))}).finally(()=>{btn.disabled=false;btn.textContent=orig})}
 
 function modelsForUpstream(name){const resolved=(name||'').trim();return modelListByUpstream[resolved]||[]}
 function upstreamSelectHtml(selected){const names=Object.keys(upstreamData).sort();if(names.length===0)return '<select data-field="upstream" class="m-select" disabled><option value="">（未配置上游）</option></select>';let h='<select data-field="upstream" class="m-select" onchange="onAliasUpstreamChange(this)">';for(const name of names){h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
 function modelSelectHtml(selected,upstreamName){const models=modelsForUpstream(upstreamName);if(models.length===0)return '<select data-field="val" class="m-select" disabled><option value="">（未配置模型）</option></select>';let h='<select data-field="val" class="m-select">';let found=!selected;for(const m of models){if(selected===m)found=true;h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (自定义)</option>';h+='</select>';return h}
 function socks5SelectHtml(selected){let h='<select data-field="socks5_proxy" class="m-select"><option value="">直连</option>';let found=!selected;for(const p of socks5Data){if(!p||!p.addr)continue;const addr=String(p.addr).trim();if(!addr)continue;if(selected===addr)found=true;const label=p.name?String(p.name)+' ('+addr+')':addr;h+='<option value="'+esc(addr)+'"'+(selected===addr?' selected':'')+'>'+esc(label)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (已失效)</option>';h+='</select>';return h}
-function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="6" class="empty-hint">暂无别名配置</td></tr>';return}const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:'',upstream:'',socks5_proxy:'',with_reasoning:false};const upName=entry.upstream||defaultUp;return '<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+upstreamSelectHtml(upName)+'</td><td data-model-cell="1">'+modelSelectHtml(entry.target_model||'',upName)+'</td><td>'+socks5SelectHtml(entry.socks5_proxy||'')+'</td><td><input type="checkbox" data-field="with_reasoning" title="将历史 assistant 消息中的 reasoning_content 回传给上游"'+(entry.with_reasoning?' checked':'')+'></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>'}).join('')}
+let wbLoginTimer=null,wbLoginId=null;
+function wbRenderLoginUI(){const card=document.getElementById('wbCard');if(!card)return;card.style.display='';wbRenderProxyOptions();wbRenderStatus()}
+function wbRenderProxyOptions(){const sel=document.getElementById('wbLoginProxy');if(!sel)return;const cur=sel.value;sel.innerHTML='<option value="">直连</option>'+socks5Data.filter(p=>p&&p.addr).map(p=>'<option value="'+esc(String(p.addr).trim())+'">'+esc(p.name?p.name+' ('+p.addr+')':String(p.addr))+'</option>').join('');for(const o of sel.options){if(o.value===cur){sel.value=cur;break}}}
+function wbFmtTime(iso){if(!iso)return '-';const d=new Date(iso);return isNaN(d.getTime())?iso:(d.getMonth()+1).toString().padStart(2,'0')+'-'+d.getDate().toString().padStart(2,'0')+' '+d.toTimeString().slice(0,5)}
+function wbAccountStateHtml(a){if(a.disabled)return '❌ 禁用<div class="field-hint">'+esc(a.disabled_reason||'')+'</div>';const now=Date.now();if(a.cooling_until&&new Date(a.cooling_until).getTime()>now)return '🔒 冷却<div class="field-hint">'+esc((a.cooling_model?'模型 '+a.cooling_model+' · ':'')+wbFmtTime(a.cooling_until)+' 解除'+(a.cooling_reason?' · '+esc(a.cooling_reason):''))+'</div>';if(a.breaker_until&&new Date(a.breaker_until).getTime()>now)return '⛔ 熔断<div class="field-hint">'+wbFmtTime(a.breaker_until)+' 解除'+(a.last_error?' · '+esc(a.last_error):'')+'</div>';if(a.fail_streak>0)return '✅ 可用<div class="field-hint">近期失败 '+a.fail_streak+' 次</div>';return '✅ 可用'}
+async function wbRenderStatus(){const tb=document.querySelector('#wbStatusTable tbody');if(!tb)return;try{const r=await fetch('/api/wb/status');if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();const ups=d.upstreams||{};const names=Object.keys(ups).sort();if(!names.length){tb.innerHTML='<tr><td colspan="7" style="color:var(--text-ter)">尚未配置 WorkBuddy 上游；可先点「浏览器登录」拿账号，再到上方添加上游（接口类型 WorkBuddy）</td></tr>';return}let rows='';for(const name of names){const u=ups[name];const accts=u.accounts||[];if(!accts.length){rows+='<tr><td>'+esc(name)+'</td><td colspan="6" style="color:var(--text-ter)">账号目录 '+esc(u.auth_dir||'')+' 无凭证——点「浏览器登录」入库</td></tr>';continue}accts.forEach((a,i)=>{rows+='<tr>'+(i===0?'<td rowspan="'+accts.length+'">'+esc(name)+'</td>':'')+'<td>'+esc(a.uid||'-')+'</td><td>'+esc(a.nickname||'-')+'</td><td>'+esc(a.realm||'-')+'</td><td>'+wbAccountStateHtml(a)+'</td><td>'+wbFmtTime(a.token_expires)+'</td><td style="color:var(--text-ter)">'+esc(a.last_error||'')+'</td></tr>'})}tb.innerHTML=rows}catch(e){tb.innerHTML='<tr><td colspan="7" style="color:#e05c5c">状态加载失败: '+esc(String(e&&e.message||e))+'</td></tr>'}}
+function wbLoginBox(show,text,linkHtml){const box=document.getElementById('wbLoginBox');if(!box)return;box.style.display=show?'':'none';const st=document.getElementById('wbLoginStatus');if(st)st.innerHTML=text;const lk=document.getElementById('wbLoginLink');if(lk)lk.innerHTML=linkHtml||''}
+function wbStopLoginPoll(){if(wbLoginTimer){clearInterval(wbLoginTimer);wbLoginTimer=null}wbLoginId=null;const btn=document.getElementById('wbLoginBtn');if(btn){btn.disabled=false;btn.textContent='浏览器登录'}}
+async function wbStartLogin(){const btn=document.getElementById('wbLoginBtn');if(btn&&btn.disabled)return;if(btn){btn.disabled=true;btn.textContent='发起中…'}const realm=document.getElementById('wbLoginRealm').value||'cn';const proxy=document.getElementById('wbLoginProxy').value||'';try{const r=await fetch('/api/wb/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'start',realm:realm,proxy:proxy})});if(!r.ok){const t=await r.text();throw new Error(t||('HTTP '+r.status))}const d=await r.json();wbLoginId=d.id;wbLoginBox(true,'⏳ 等待你在浏览器完成登录…（<b>此页面可以关掉</b>，网关服务器会在后台自动接管授权结果，15 分钟内有效）','<a href="'+esc(d.auth_url)+'" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-weight:600">👉 点这里打开授权页（'+esc(d.realm)+'）</a><br><span style="color:var(--text-ter);font-size:11px">'+esc(d.auth_url)+'</span>');const w=window.open(d.auth_url,'_blank');if(!w){const st=document.getElementById('wbLoginStatus');st.innerHTML='⚠️ 浏览器拦截了弹窗——请手动点击上方链接打开授权页'}if(wbLoginTimer)clearInterval(wbLoginTimer);wbLoginTimer=setInterval(wbPollLogin,2500)}catch(e){showToast('发起登录失败: '+(e&&e.message?e.message:e),'error');wbStopLoginBtn()}finally{if(btn&&btn.disabled){btn.textContent='等待登录…'}}}
+function wbStopLoginBtn(){const btn=document.getElementById('wbLoginBtn');if(btn){btn.disabled=false;btn.textContent='浏览器登录'}}
+async function wbPollLogin(){if(!wbLoginId)return;try{const r=await fetch('/api/wb/login?id='+encodeURIComponent(wbLoginId));if(r.status===404){wbLoginBox(true,'⚠️ 登录会话已过期，请重新点击「浏览器登录」','');wbStopLoginPoll();wbRenderStatus();return}if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();if(d.status==='pending')return;if(d.status==='success'){wbLoginBox(true,'🎉 登录成功：<b>'+esc(d.nickname||'')+'</b>（uid '+esc(d.uid||'')+'），已自动加入账号池','');showToast('WorkBuddy 账号 '+wbUIDShort(d.uid)+' 已入池','success')}else if(d.status==='expired'){wbLoginBox(true,'⚠️ 登录超时未完成，请重新点击「浏览器登录」','')}else{wbLoginBox(true,'❌ 登录失败：'+esc(d.last_error||'未知错误'),'')}wbStopLoginPoll();wbRenderStatus()}catch(e){}}
+function wbUIDShort(uid){uid=String(uid||'');return uid.length>8?uid.slice(0,8):uid}
+async function wbCheckinNow(){try{const r=await fetch('/api/wb/checkin',{method:'POST'});if(!r.ok){const t=await r.text();throw new Error(t||('HTTP '+r.status))}const d=await r.json();const res=d.results||[];const ok=res.filter(x=>x.ok).length;showToast(ok?('签到完成：'+ok+'/'+res.length+' 成功'):'无可签到账号（仅 CN 账号支持签到）',ok?'success':'info');wbRenderStatus()}catch(e){showToast('签到失败: '+(e&&e.message?e.message:e),'error')}}
+function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="7" class="empty-hint">暂无别名配置</td></tr>';return}const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:'',upstream:'',socks5_proxy:'',with_reasoning:false,system_prompt:''};const upName=entry.upstream||defaultUp;return '<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+upstreamSelectHtml(upName)+'</td><td data-model-cell="1">'+modelSelectHtml(entry.target_model||'',upName)+'</td><td>'+socks5SelectHtml(entry.socks5_proxy||'')+'</td><td><input type="checkbox" data-field="with_reasoning" title="将历史 assistant 消息中的 reasoning_content 回传给上游"'+(entry.with_reasoning?' checked':'')+'></td><td><input value="'+esc(entry.system_prompt||'')+'" data-field="system_prompt" placeholder="例如: 你是一位资深的编程助手" title="每次请求自动注入的 system 角色提示，与客户端 system 内容合并，不填则不注入"></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>'}).join('')}
 function onAliasUpstreamChange(sel){const row=sel.closest('tr');const holder=row.querySelector('[data-model-cell]');const current=row.querySelector('[data-field="val"]');const currentVal=current?current.value.trim():'';holder.innerHTML=modelSelectHtml(currentVal,sel.value)}
-function addAliasRow(){collectUpstreams();collectSocks5();const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+upstreamSelectHtml(defaultUp)+'</td><td data-model-cell="1">'+modelSelectHtml('', defaultUp)+'</td><td>'+socks5SelectHtml('')+'</td><td><input type="checkbox" data-field="with_reasoning" title="将历史 assistant 消息中的 reasoning_content 回传给上游"></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
-function delAlias(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="6" class="empty-hint">暂无别名配置</td></tr>'}
-function collectAliases(){const r={};document.querySelectorAll('#aliasTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),u=tr.querySelector('[data-field="upstream"]'),v=tr.querySelector('[data-field="val"]'),p=tr.querySelector('[data-field="socks5_proxy"]'),w=tr.querySelector('[data-field="with_reasoning"]');if(k&&k.value.trim()){const aliasKey=k.value.trim();let targetModel=v?v.value.trim():'';const upstreamName=u?u.value.trim():'';const socks5Proxy=p?p.value.trim():'';const withReasoning=w?w.checked:false;if(!targetModel&&(upstreamName||socks5Proxy||withReasoning))targetModel=aliasKey;if(targetModel||upstreamName||socks5Proxy||withReasoning){r[aliasKey]={target_model:targetModel,upstream:upstreamName,socks5_proxy:socks5Proxy,with_reasoning:withReasoning}}}});aliasData=r;return r}
+function addAliasRow(){collectUpstreams();collectSocks5();const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+upstreamSelectHtml(defaultUp)+'</td><td data-model-cell="1">'+modelSelectHtml('', defaultUp)+'</td><td>'+socks5SelectHtml('')+'</td><td><input type="checkbox" data-field="with_reasoning" title="将历史 assistant 消息中的 reasoning_content 回传给上游"></td><td><input value="" data-field="system_prompt" placeholder="角色提示，留空不注入" title="每次请求自动注入的 system 角色提示，与客户端 system 内容合并，不填则不注入"></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
+function delAlias(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="7" class="empty-hint">暂无别名配置</td></tr>'}
+function collectAliases(){const r={};document.querySelectorAll('#aliasTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),u=tr.querySelector('[data-field="upstream"]'),v=tr.querySelector('[data-field="val"]'),p=tr.querySelector('[data-field="socks5_proxy"]'),w=tr.querySelector('[data-field="with_reasoning"]'),sp=tr.querySelector('[data-field="system_prompt"]');if(k&&k.value.trim()){const aliasKey=k.value.trim();let targetModel=v?v.value.trim():'';const upstreamName=u?u.value.trim():'';const socks5Proxy=p?p.value.trim():'';const withReasoning=w?w.checked:false;const systemPrompt=sp?sp.value.trim():'';if(!targetModel&&(upstreamName||socks5Proxy||withReasoning||systemPrompt))targetModel=aliasKey;if(targetModel||upstreamName||socks5Proxy||withReasoning||systemPrompt){r[aliasKey]={target_model:targetModel,upstream:upstreamName,socks5_proxy:socks5Proxy,with_reasoning:withReasoning,system_prompt:systemPrompt}}}});aliasData=r;return r}
 
 
 
@@ -9678,6 +9903,10 @@ func warmUpstreamConnections() {
 				if up == nil || up.BaseURL == "" {
 					continue
 				}
+				// WorkBuddy 上游的鉴权/路径由 wb 子系统按账号管理，HEAD /models 无意义且可能触风控，跳过。
+				if up.APIType == UpstreamWorkBuddy {
+					continue
+				}
 				endpoint := getUpstreamModelsEndpoint(up)
 				if endpoint == "" {
 					continue
@@ -9724,12 +9953,24 @@ func main() {
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
 	flag.StringVar(&adminPassword, "password", "", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
+	wbLogin := flag.String("wb-login", "", "WorkBuddy OAuth 设备授权登录：url=取授权链接，poll=完成登录后取 token 落盘；如 -wb-login=url -wb-realm=cn")
+	flag.StringVar(wbLogin, "workbuddy-login", "", "同 -wb-login（url|poll）")
+	wbRealm := flag.String("wb-realm", "cn", "WorkBuddy 登录域：cn=国内版（CodeBuddy）/ global=国际版（WorkBuddy）")
+	wbAuthDir := flag.String("wb-auth-dir", "auths", "WorkBuddy 账号凭证目录（相对配置文件或绝对路径）")
+	wbProxy := flag.String("wb-proxy", "", "登录流走 SOCKS5 代理（需在 socks5_proxies 中配置该地址）")
 	flag.Parse()
 
 	// ok=false 表示配置文件损坏（原件已备份为 *.bad-*）：
 	// 此时禁止把空配置写回磁盘，否则用户仅存的配置原件会被销毁。
 	cfg, configOK := loadConfig(configPath)
 	applyConfig(cfg)
+
+	// WorkBuddy 登录子流程：完成即退出，不启服务。
+	if strings.TrimSpace(*wbLogin) != "" {
+		wbRunLoginCLI(*wbLogin, *wbRealm, *wbAuthDir, *wbProxy)
+		return
+	}
+
 	if configOK {
 		if err := saveConfig(configPath, cfg); err != nil {
 			log.Printf("警告: 无法保存配置: %v", err)
@@ -9740,6 +9981,7 @@ func main() {
 	loadPricing()
 	startUsageSaveWorker()
 	startConnectionKeepAliveWorker()
+	wbStartBackgroundTasks()
 	log.Printf("配置已从 %s 加载", configPath)
 	log.Printf("LLM Gateway")
 	log.Printf("===================")
@@ -9747,6 +9989,7 @@ func main() {
 	log.Printf("上游:     %d 个", getConfiguredUpstreamCount())
 	log.Printf("模型：  %d 个自定义模型", countConfiguredModels())
 	log.Printf("别名：  %d", len(modelAlias))
+	wbPoolSummaryLog()
 
 	if adminPassword != "" {
 		log.Printf("管理面板: http://localhost:%s/ （密码认证已启用）", port)
@@ -9770,6 +10013,9 @@ func main() {
 	http.HandleFunc("/api/pricing", requireAuth(sameOriginWriteGuard(adminPricingHandler)))
 	http.HandleFunc("/api/reload", requireAuth(sameOriginWriteGuard(reloadHandler)))
 	http.HandleFunc("/api/upstream/models", requireAuth(sameOriginWriteGuard(upstreamModelsHandler)))
+	http.HandleFunc("/api/wb/status", requireAuth(wbStatusHandler))
+	http.HandleFunc("/api/wb/checkin", requireAuth(sameOriginWriteGuard(wbCheckinHandler)))
+	http.HandleFunc("/api/wb/login", requireAuth(sameOriginWriteGuard(wbLoginHandler)))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
