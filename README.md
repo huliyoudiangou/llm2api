@@ -243,14 +243,18 @@ llm-gateway.exe -wb-login=poll -wb-realm=cn -config config.json
 ```
 
 - 不需要 `base_url` / `api_key`：端点由账号域内置决定（`cn` → `copilot.tencent.com`，`global` → `www.workbuddy.ai`）
-- `custom_models` 是模型唯一来源（与其他上游一致，供别名选择）；点「获取模型列表」会**从账号池按域实时探测**（每域取最多 2 个账号的结果并集）：`wb_realm=cn` 只探国内版、`global` 只探国际版、`all` 两域都探并合并。**命名与路由严格对齐**：显式单域上游返回裸名（域由上游兜底）；`all` 混池时国际版结果自动加 `global:` 前缀。某域池内无账号时**不列该域模型**（避免配出必然 503 的别名）；账号探测全失败才回退内置静态名单
+- `custom_models` 是模型唯一来源（与其他上游一致，供别名选择）；点「获取模型列表」会**从账号池按域实时探测**（每域取最多 2 个账号的结果并集）：`wb_realm=cn` 只探国内版、`global` 只探国际版、`all` 两域都探并合并。探测同时打**两个目录端点取并集**——官方云目录 `/v3/config`（新增模型先上这里，如 `kimi-k2.8-preview` / `deepseek-v4.1-flash(-sg)` / `gpt-6-astra` / `hy4-preview-f`）与旧的 `personal/models`（仍暴露个别模型，如 `gpt-5.3-codex`）；任一端点成功即合并，单端点成功仍可用。目录解析以**根表 `data.models` 为准**（过滤 `disabled`，`availableModels` 非空时按白名单），agent 选择器引用必须能解析回根表才计入（sub-agent 专用的 `lite` 之类不可服务，自动丢弃）。**命名与路由严格对齐**：显式单域上游返回裸名（域由上游兜底）；`all` 混池时国际版结果自动加 `global:` 前缀。某域池内无账号时**不列该域模型**（避免配出必然 503 的别名）；账号探测全失败才回退内置静态名单
 - `wb_realm`：账号域过滤——`all`（默认，池内 cn/global 账号都可用）/ `cn` / `global`
 - **`cn:` / `global:` 前缀**（与上游项目同协议）：模型名带前缀即强制路由到对应域（优先级高于 `wb_realm`）；无前缀默认 `cn`。Global 域先打 `/console/chat/completions`，404/405 自动回退 `/v2/chat/completions`
 - `wb_max_in_flight`：单账号最大在途请求（默认 3），占满的账号不参与选号
 - `wb_prompt_mode`：`passthrough`（默认，透传客户端 system）/ `custom`（用网关自有提示词替换 system，从源头消除模板句误报；`wb_prompt_text` 自定义，留空用内置工程助手提示词）
 - `wb_sanitize`（默认 true）：出站指纹脱敏——剥离 `x-anthropic-billing-header` / `cc_*` 键值，对 Claude Code / Codex CLI 固定模板句做最小改写，消除上游按逐字指纹拦截的 `11128` 反探测
+- **官方桌面端指纹**（默认启用，对齐 [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) 实测的官方客户端行为）：
+  - **用量归属头**：未配置 `wb_client_name` 时默认伪造官方桌面端头组（`X-Agent-Purpose: conversation` + `X-Agent-Intent: craft` + `X-Agent-Type: main` + `X-Private-Data: false` + `X-IDE-Name/Type/Version` + `X-Product: WorkBuddy`）——**空的 client/agentPurpose 在官网用量归因里是显眼的「网关特征」**；显式配 `wb_client_name: "SaaS"` 还原旧行为（只发 `X-Product: SaaS`）
+  - **设备指纹头**：按账号稳定派生 `X-Machine-ID` / `X-Session-ID`（`sha256("wb2a:"+purpose+":"+uid)` 前 18 字节 hex，与参考项目逐字一致）——每个账号一台固定虚拟设备，跨重启恒定、账号间互异；缺失设备标识的多号流量易被关联风控。chat / billing / token 刷新 / 模型探测路径均携带
+  - **billing 域 UA**：官方客户端在签到/积分这类白名单接口用单段 `WorkBuddy/<ver>` UA（chat 域才是三段式）
 - `wb_checkin`（默认关）：后台窗口（09 点后）为 CN 账号自动每日签到（幂等）
-- 进阶可选项：`wb_chat_base_cn` / `wb_chat_base_global`（端点覆盖）、`wb_user_agent` / `wb_client_version` / `wb_cli_version` / `wb_client_name`（归因与 UA）、`wb_device_token`（设备风控头）
+- 进阶可选项：`wb_chat_base_cn` / `wb_chat_base_global`（端点覆盖）、`wb_user_agent` / `wb_client_version` / `wb_cli_version` / `wb_client_name`（归因与 UA；`"SaaS"` 还原旧归属行为）、`wb_device_token`（设备风控头）
 - 账号凭证明文文件与上游项目格式完全一致（嵌套形 `{"auth":{...},"account":{...}}`，兼容扁平形）；刷新后轮转的 refresh token 会**原子写回原文件**，重启后凭文件里的 refresh token 继续可用
 
 ### 账号池与流量治理
@@ -259,12 +263,13 @@ llm-gateway.exe -wb-login=poll -wb-realm=cn -config config.json
 - **分级冷却/熔断**（对齐上游项目状态机语义）：
   - `402` / 余额关键词 → 硬冷却至**次日 04:00**（等签到恢复）
   - `429` / 限流文案 → 软冷却 600s 起、连击指数退避封顶 2h；业务码 `6004`（模型级用量超限）带「将在 … 重置」时**只冷却该模型**，切其他模型立即可用
-  - `12153` offline session → **禁用**该账号（需重新登录）；`11140 request illegal` → 禁用；`14017 trial` → 软冷却
+  - `12153` offline session → **禁用**该账号（需重新登录）；`11140 request illegal` → 禁用；`14017 trial` → 软冷却（口径：**试用版未激活**，需在官网开通正式套餐）
+  - 上游 WAF 拦截（403 + HTML Block Page）→ **单独识别**：90s 短冷却 + 轮转 + 回干净 JSON 错误（不透传 HTML——客户端拿到 403+HTML 会误解成「api 密钥无效」）
   - 上游偶发 `404` → 60s 浅冷却；`5xx` 连击 3 次 → 熔断 30m 起、指数退避封顶 6h
   - 内容审核拦截（`11128` 类）与参数解析失败（`11101`）**不罚账号**：前者直接回防火墙口径 400，后者照常换号再试
 - **会话粘性**：同对话（`conversationId` / `metadata.conversation_id`，兜底最后一条 user 消息）尽量绑定同账号（TTL 30min），保证多轮上下文与上游缓存命中；绑定号被冷却/禁用时自动解绑重分配
 - **token 治理**：请求前 access token 剩余 <10min 即刷新；后台每 30min 为剩余 <12h 的账号保活刷新；刷新失败遇 session 失效自动禁用
-- **观测**：`/api/wb/status` 看池状态（禁用原因/冷却截止/在途/失败连击/token 过期），`?credits=1` 附带各账号剩余积分；`/api/wb/checkin` 手动签到
+- **观测**：`/api/wb/status` 看池状态（禁用原因/冷却截止/在途/失败连击/token 过期），`?credits=1` 附带各账号剩余积分；`/api/wb/checkin` 手动签到；**「WorkBuddy 账号台账」面板**（`/api/wb/accounts`）按凭证文件展示全部账号（含被禁用/无法加载的文件，不再凭空消失），每行含状态徽章、实时余额、令牌有效期进度条、成功/错误计数、在途数；支持**单号余额刷新**（`/api/wb/accounts/credit`）、**临时禁用/启用**（改名 `.disabled` 后缀，可逆不丢凭证，热重载即时生效）、**删除**与**单号签到**（`/api/wb/checkin?file=...`）
 - 冷却/熔断状态为**内存态**（重启清零，凭证本身已落盘不受影响）
 
 ### 与上游项目的能力差异

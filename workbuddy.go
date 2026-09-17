@@ -8,12 +8,14 @@ package main
 //   - OAuth 设备授权登录（-wb-login 子命令），凭证落盘 auths/workbuddy-<uid>.json；
 //   - 账号池：多账号轮转、单号故障自动换号、在途租约、会话粘性（同对话尽量同账号）；
 //   - 分级熔断/冷却：429/限流文案软冷却（指数退避）、402/余额耗尽硬冷却至次日 04:00、
-//     6004 模型级限流只冷却该模型、session 失效（12153）禁用、上游故障连败熔断；
+//     6004 模型级限流只冷却该模型、session 失效（12153）禁用、WAF 拦截页识别+短冷却+干净
+//     JSON 错误（不透传 HTML）、上游故障连败熔断；
 //   - access token 临期自动刷新（/v2/plugin/auth/token/refresh），刷新结果原子写回账号文件；
 //   - 出站改写：强制 stream:true、tool_choice/developer 角色归一、DeepSeek 思维链注入、
 //     reasoning_content 回填、Claude Code/Codex 指纹脱敏；
 //   - SSE：流式帧规范化（tool_calls 函数名跨帧回填），非流式客户端请求本地聚合为单个响应；
-//   - 模型列表：CN 动态探测（cli agent 过滤）+ 静态兜底；Global 静态名单；
+//   - 模型列表：/v3/config 云目录 + 旧 personal/models 双端点并集（CN/global 同法）；探测
+//     全败时回退静态名单；Global 静态名单；
 //   - 后台任务：token 保活刷新、CN 账号每日签到（upstream.wb_checkin = true 时）。
 //
 // 上游协议（端点/请求头/业务错误码）以 workbuddy2api 实测实现为准；两处细节与其一致：
@@ -25,6 +27,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -55,6 +58,7 @@ const (
 	wbRefreshPath       = "/v2/plugin/auth/token/refresh"
 	wbModelsPathCN      = "/console/enterprises/personal/models"
 	wbModelsPathGlobal  = "/v2/enterprises/personal/models"
+	wbModelsV3Path      = "/v3/config" // 官方云模型目录（较 personal/models 更全更新）
 	wbBillingMeterV2    = "/v2/billing/meter/get-user-resource"
 	wbBillingMeterPlain = "/billing/meter/get-user-resource"
 	wbCheckinV2         = "/v2/billing/meter/daily-checkin"
@@ -69,6 +73,7 @@ const (
 	wbSoftCooldown    = 600 * time.Second // 软限流冷却基数（连击指数退避）
 	wbSoftCooldownMax = 2 * time.Hour     // 软限流冷却封顶
 	wbNotFoundCool    = 60 * time.Second  // 404 固定浅冷却
+	wbWAFCool         = 90 * time.Second  // WAF 拦截短冷却（临时风控，多号轮转避开）
 	wbBreakerThresh   = 3                 // 连续 5xx 失败触发熔断
 	wbBreakerBase     = 30 * time.Minute  // 熔断冷却基数
 	wbBreakerMax      = 6 * time.Hour     // 熔断冷却封顶
@@ -78,17 +83,18 @@ const (
 )
 
 // wbStaticModelsCN / wbStaticModelsGlobal 为模型探测失败时的静态兜底名单
-// （对齐 workbuddy2api handler.staticModels / upstream.GlobalModelNames）。
+// （global 名单 = 实测 /v3/config 云目录 ∪ 旧 personal/models 端点，2026-09 快照）。
 var wbStaticModelsCN = []string{
 	"glm-5.2", "glm-5.1", "glm-5v-turbo", "kimi-k2.7", "minimax-m3",
 	"hy3", "hy3-preview", "hy3-preview-agent", "deepseek-v4-pro", "deepseek-v4-flash",
 }
 
 var wbStaticModelsGlobal = []string{
-	"default-model", "fast-model", "balanced-model", "primary-model", "hy4-preview",
-	"gpt-5.6-sol", "gpt-5.6-terra", "deep-model", "deepseek-v4.1-flash", "gpt-6-astra",
-	"hy4-preview-f", "hy3", "glm-5.2", "gpt-5.6-luna", "gpt-5.5",
-	"gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash", "glm-5.3", "kimi-k3", "kimi-k2.6",
+	"default-model", "fast-model", "balanced-model", "primary-model", "deep-model",
+	"hy4-preview", "hy4-preview-f", "hy3", "deepseek-v4.1-flash", "deepseek-v4.1-flash-sg",
+	"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+	"gpt-5.3-codex", "gemini-3.5-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.6",
+	"kimi-k2.8-preview",
 }
 
 // wbDefaultPrompt 网关自有系统提示词（wb_prompt_mode="custom" 且未配 wb_prompt_text 时使用）。
@@ -135,6 +141,7 @@ const (
 	wbErrContentBlocked           // 内容审核拦截 → 不罚账号，直接回错
 	wbErrBadParams                // 上游 body 解析失败（11101）→ 不罚账号，仍轮转
 	wbErrAccountFault             // 账号级故障（11140 request illegal / 14017 trial）→ 冷却/禁用
+	wbErrWAF                      // 上游 WAF 拦截（403 HTML Block Page）→ 短冷却，轮转
 	wbErrClient                   // 其他 4xx → 不罚账号，仅轮转
 )
 
@@ -156,6 +163,8 @@ func (k wbErrKind) String() string {
 		return "bad_params"
 	case wbErrAccountFault:
 		return "account_fault"
+	case wbErrWAF:
+		return "waf"
 	case wbErrClient:
 		return "client"
 	default:
@@ -199,6 +208,12 @@ var (
 func wbClassify(status int, body string) wbErrKind {
 	if status == http.StatusPaymentRequired {
 		return wbErrHardCredit
+	}
+	// WAF 拦截页优先判定：返回的是 HTML 而非 JSON（腾讯 WAF Block Page），
+	// 若落入通用 4xx 分支会原样透传 HTML、客户端无从理解（表现为莫名的
+	// 「api 无效」）。单独识别：短冷却 + 轮转 + 干净的 JSON 错误。
+	if strings.Contains(body, "WAF Block Page") {
+		return wbErrWAF
 	}
 	lower := strings.ToLower(body)
 	for _, m := range wbHardMarkers {
@@ -320,6 +335,10 @@ type wbAccount struct {
 	inFlight       int
 	lastUsed       time.Time
 	lastError      string
+	lastErrorAt    time.Time
+	successCount   int64
+	errTotal       int64
+	lastSuccess    time.Time
 }
 
 // wbResolveRealm 归一化账号域：显式 global 优先，否则按 domain 后缀推断；空 → cn。
@@ -339,6 +358,13 @@ func (a *wbAccount) realm() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return wbResolveRealm(a.Realm, a.Domain)
+}
+
+// filePath 读来源文件路径（加锁，与后台刷新写 FilePath 互斥）。
+func (a *wbAccount) filePath() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.FilePath
 }
 
 // wbAcctInfo 账号字段的一致性快照：所有出站构造（headers/billing/status）只读快照，
@@ -717,6 +743,8 @@ func (p *wbPool) noteSuccess(a *wbAccount) {
 	a.coolingModel = ""
 	a.coolingReason = ""
 	a.lastError = ""
+	a.successCount++
+	a.lastSuccess = time.Now()
 }
 
 // applyError 按错误类别施加冷却/禁用/熔断（对齐 workbuddy2api applyErrorPolicy 语义）。
@@ -728,6 +756,8 @@ func (p *wbPool) applyError(a *wbAccount, kind wbErrKind, body, model string) {
 	}
 	a.lastError = body
 	now := time.Now()
+	a.lastErrorAt = now
+	a.errTotal++
 	switch kind {
 	case wbErrHardCredit:
 		a.coolingUntil = wbNextLocal4AM(now)
@@ -767,11 +797,21 @@ func (p *wbPool) applyError(a *wbAccount, kind wbErrKind, body, model string) {
 		if strings.Contains(lower, "request illegal") {
 			a.disabled = true
 			a.disabledReason = "account banned by upstream (11140 request illegal), re-login required"
+		} else if strings.Contains(lower, "trial") {
+			a.coolingUntil = now.Add(wbSoftCooldown)
+			a.coolingModel = ""
+			a.coolingReason = "试用版未激活（14017，需开通正式套餐）"
 		} else {
 			a.coolingUntil = now.Add(wbSoftCooldown)
 			a.coolingModel = ""
 			a.coolingReason = "account fault (14017)"
 		}
+	case wbErrWAF:
+		// WAF 拦截按账号维度短冷却：大概率是上游对当前出口 IP/请求形态的临时
+		// 风控，多号换着打往往能过；同一个号立刻重试只会再次撞墙。
+		a.coolingUntil = now.Add(wbWAFCool)
+		a.coolingModel = ""
+		a.coolingReason = "上游 WAF 拦截（临时风控）"
 	case wbErrNotFound:
 		a.coolingUntil = now.Add(wbNotFoundCool)
 		a.coolingModel = ""
@@ -1072,7 +1112,65 @@ func wbAcceptLanguage(realm string) string {
 	return "zh-CN"
 }
 
-// wbSetCommonHeaders 所有 API 共享的出站头。
+// wbDeviceFingerprintHeaders 按账号稳定派生的设备指纹头（X-Machine-ID / X-Session-ID）。
+//
+// 派生方式与 workbuddy-manager `deriveAccountStableID` 逐字一致：
+//
+//	sha256("wb2a:" + purpose + ":" + uid) 前 18 字节 hex = 36 字符
+//
+// 语义是「每个账号一台固定虚拟设备」——跨重启恒定、账号间互异。上游官方客户端本就
+// 带设备标识，网关若完全不带，会成为「唯一没有设备标识的流量」，多号场景下易被按
+// 设备指纹缺失关联风控。uid 为空时不发（匿名请求无设备可言，与上游同语义）。
+//
+// 派生值与参考项目保持一致：同一账号在「经网关」与「经参考项目」两条路上必须是
+// 同一台设备，否则反而制造出可被关联的异常。
+func wbDeviceFingerprintHeaders(uid string) map[string]string {
+	u := strings.TrimSpace(uid)
+	if u == "" {
+		return nil
+	}
+	derive := func(purpose string) string {
+		sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + u))
+		return hex.EncodeToString(sum[:18])
+	}
+	return map[string]string{
+		"X-Machine-ID": derive("machine"),
+		"X-Session-ID": derive("session"),
+	}
+}
+
+// wbAttributionHeaders chat 路径的用量归属头（对齐 workbuddy-manager attribution_headers）。
+//
+// 未配置 wb_client_name 时**默认伪造官方 WorkBuddy 桌面端头组**（X-Agent-Purpose +
+// X-IDE-* 四头 + X-Product=WorkBuddy），与官方 application-manifest.js 同形。参考项目
+// 实测结论：上游 2026-09-14 起把默认从「X-Product=SaaS、不设 X-IDE-*」翻转为这套桌面端
+// 指纹，理由是**空的 client/agentPurpose 在官网用量归因里是显眼的「网关特征」**。
+// 显式配 wb_client_name="SaaS" 可还原旧行为（只发 X-Product=SaaS）。
+func wbAttributionHeaders(cfg *UpstreamConfig) map[string]string {
+	name := ""
+	if cfg != nil {
+		name = strings.TrimSpace(cfg.WBClientName)
+	}
+	if name == "" {
+		name = "WorkBuddy"
+	}
+	if name == "SaaS" {
+		return map[string]string{"X-Product": "SaaS"}
+	}
+	cv := wbDefaultClientVersion
+	if cfg != nil && strings.TrimSpace(cfg.WBClientVersion) != "" {
+		cv = strings.TrimSpace(cfg.WBClientVersion)
+	}
+	return map[string]string{
+		"X-Agent-Purpose": "conversation",
+		"X-IDE-Name":      name,
+		"X-IDE-Type":      name,
+		"X-IDE-Version":   cv,
+		"X-Product":       name,
+	}
+}
+
+// wbSetCommonHeaders 所有 API 共享的出站头。uid 非空时附账号级设备指纹头。
 func wbSetCommonHeaders(req *http.Request, cfg *UpstreamConfig, realm string) {
 	origin := wbOriginFor(realm)
 	req.Header.Set("Content-Type", "application/json")
@@ -1085,10 +1183,18 @@ func wbSetCommonHeaders(req *http.Request, cfg *UpstreamConfig, realm string) {
 	req.Header.Set("Accept-Language", wbAcceptLanguage(realm))
 }
 
-// wbSetChatHeaders chat 出站头：通用头 + 账号身份 + 归属 + 会话头族。
+// wbSetAccountHeaders 通用头 + 账号设备指纹头（需要 uid 的出站路径调用）。
+func wbSetAccountHeaders(req *http.Request, cfg *UpstreamConfig, realm, uid string) {
+	wbSetCommonHeaders(req, cfg, realm)
+	for k, v := range wbDeviceFingerprintHeaders(uid) {
+		req.Header.Set(k, v)
+	}
+}
+
+// wbSetChatHeaders chat 出站头：通用头 + 账号身份 + 设备指纹 + 归属 + 会话头族。
 func wbSetChatHeaders(req *http.Request, cfg *UpstreamConfig, info wbAcctInfo, meta wbChatMeta) {
 	realm := info.Realm
-	wbSetCommonHeaders(req, cfg, realm)
+	wbSetAccountHeaders(req, cfg, realm, info.UID)
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if info.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+info.AccessToken)
@@ -1115,21 +1221,14 @@ func wbSetChatHeaders(req *http.Request, cfg *UpstreamConfig, info wbAcctInfo, m
 			req.Header.Set("X-No-Department-Info", "1")
 		}
 	}
-	// 用量归属头
-	if cfg != nil && strings.TrimSpace(cfg.WBClientName) != "" {
-		name := strings.TrimSpace(cfg.WBClientName)
-		cv := wbDefaultClientVersion
-		if strings.TrimSpace(cfg.WBClientVersion) != "" {
-			cv = strings.TrimSpace(cfg.WBClientVersion)
-		}
-		req.Header.Set("X-Agent-Purpose", "conversation")
-		req.Header.Set("X-IDE-Name", name)
-		req.Header.Set("X-IDE-Type", name)
-		req.Header.Set("X-IDE-Version", cv)
-		req.Header.Set("X-Product", name)
-	} else {
-		req.Header.Set("X-Product", "SaaS")
+	// 用量归属头：默认伪造官方 WorkBuddy 桌面端指纹（见 wbAttributionHeaders）。
+	for k, v := range wbAttributionHeaders(cfg) {
+		req.Header.Set(k, v)
 	}
+	// SDK 指纹头：与官方桌面端同形，抹平「非官方客户端」特征。
+	req.Header.Set("X-Agent-Intent", "craft")
+	req.Header.Set("X-Agent-Type", "main")
+	req.Header.Set("X-Private-Data", "false")
 	if info.DeviceToken != "" {
 		req.Header.Set("X-Device-Token", info.DeviceToken)
 	} else if cfg != nil && strings.TrimSpace(cfg.WBDeviceToken) != "" {
@@ -1193,6 +1292,10 @@ func wbSetBillingHeaders(req *http.Request, cfg *UpstreamConfig, info wbAcctInfo
 		req.Header.Set("X-Device-Token", info.DeviceToken)
 	} else if cfg != nil && strings.TrimSpace(cfg.WBDeviceToken) != "" {
 		req.Header.Set("X-Device-Token", strings.TrimSpace(cfg.WBDeviceToken))
+	}
+	// 账号级设备指纹（与 chat 路径同源同值，保证同一账号是一台「稳定设备」）。
+	for k, v := range wbDeviceFingerprintHeaders(info.UID) {
+		req.Header.Set(k, v)
 	}
 }
 
@@ -2009,7 +2112,7 @@ func wbRefreshToken(ctx context.Context, cfg *UpstreamConfig, a *wbAccount, prox
 		return err
 	}
 	realm := wbResolveRealm(a.Realm, a.Domain)
-	wbSetCommonHeaders(req, cfg, realm)
+	wbSetAccountHeaders(req, cfg, realm, a.UID)
 	req.Header.Set("X-Refresh-Token", a.RefreshToken)
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
@@ -2041,72 +2144,178 @@ func wbRefreshToken(ctx context.Context, cfg *UpstreamConfig, a *wbAccount, prox
 	return nil
 }
 
-// wbFetchModels 拉取动态模型列表（cli agent 过滤）。realm 决定端点路径。
-func wbFetchModels(ctx context.Context, cfg *UpstreamConfig, a *wbAccount, proxyAddr string) ([]string, error) {
+// wbFetchModels 拉取动态模型列表，返回 (去重并集, 是否部分成功)。
+//
+// 双端点取并集（解决「模型列表获取不全」）：
+//   - /v3/config 官方云模型目录：新版入口，新增模型先上这里（与 codebuddy2api 的
+//     fetch_model_scopes 对齐）。models 是账号根表（全量），agents 里 name=cli 的
+//     选择器还可能引用根表之外的共享/别名条目，因此选择器引用也纳入并集。
+//   - 旧 /v2|/console/enterprises/personal/models：部分部署仍只在此暴露个别模型
+//     （如 intl 的 gpt-5.3-codex），任一端点成功即并入。
+//
+// 全部失败才返回错误。部分成功（某端点失败/解析失败）返回 partial=true，调用方可记日志。
+func wbFetchModels(ctx context.Context, cfg *UpstreamConfig, a *wbAccount, proxyAddr string) ([]string, bool, error) {
 	info := a.snapshot()
 	realm := info.Realm
-	url := wbChatBase(cfg, realm)
+	// 旧端点按域分路径；/v3/config 两条域路径通用。
+	base := wbChatBase(cfg, realm)
+	legacyURL := base
 	if realm == "global" {
-		url += wbModelsPathGlobal
+		legacyURL += wbModelsPathGlobal
 	} else {
-		url += wbModelsPathCN
+		legacyURL += wbModelsPathCN
 	}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	wbSetCommonHeaders(req, cfg, realm)
-	req.Header.Set("Authorization", "Bearer "+info.AccessToken)
+	v3URL := base + wbModelsV3Path
+
 	client, _ := getModelHTTPClient(proxyAddr, false)
-	resp, err := client.Do(req.WithContext(ctx))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamModelsBodyBytes))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("workbuddy models status %d: %s", resp.StatusCode, truncateForLog(string(raw), 120))
-	}
-	var env struct {
-		Code int `json:"code"`
-		Data struct {
-			Models []struct {
-				ID       string `json:"id"`
-				Disabled bool   `json:"disabled"`
-			} `json:"models"`
-			Agents []struct {
-				Name   string   `json:"name"`
-				Models []string `json:"models"`
-			} `json:"agents"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("workbuddy models parse: %w", err)
-	}
-	if env.Code != 0 {
-		return nil, fmt.Errorf("workbuddy models code=%d", env.Code)
-	}
-	byID := map[string]struct{ disabled bool }{}
-	for _, m := range env.Data.Models {
-		byID[m.ID] = struct{ disabled bool }{m.Disabled}
-	}
-	var cliIDs []string
-	for _, ag := range env.Data.Agents {
-		if ag.Name == "cli" {
-			cliIDs = ag.Models
-			break
+
+	// wbFetchModelsURL 拉单个端点并解析为 (模型并集, nil)。选择器引用与根表条目都算候选。
+	fetchOne := func(url string) ([]string, error) {
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
 		}
-	}
-	out := make([]string, 0, len(cliIDs))
-	for _, id := range cliIDs {
-		if m, ok := byID[id]; ok && !m.disabled {
+		wbSetAccountHeaders(req, cfg, realm, info.UID)
+		req.Header.Set("Authorization", "Bearer "+info.AccessToken)
+		resp, err := client.Do(req.WithContext(ctx))
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamModelsBodyBytes))
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("workbuddy models status %d: %s", resp.StatusCode, truncateForLog(string(raw), 120))
+		}
+		var env struct {
+			Code int `json:"code"`
+			Data struct {
+				Models []struct {
+					ID       string   `json:"id"`
+					Name     string   `json:"name"`
+					Aliases  []string `json:"aliases"`
+					Disabled bool     `json:"disabled"`
+				} `json:"models"`
+				Agents []struct {
+					Name   string   `json:"name"`
+					Models []any    `json:"models"`
+					Tags   []string `json:"tags"`
+				} `json:"agents"`
+				AvailableModels []string `json:"availableModels"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return nil, fmt.Errorf("workbuddy models parse: %w", err)
+		}
+		if env.Code != 0 {
+			return nil, fmt.Errorf("workbuddy models code=%d", env.Code)
+		}
+		// 根表为唯一事实来源；选择器引用只是指向根表条目的另一形态（id/name/别名）。
+		// 解析不到根表的引用（如 sub-agent 专用的 "lite"）不可作为对话模型，丢弃——
+		// 对齐 codebuddy2api select_product_models 的解析语义。
+		type entry struct{ disabled bool }
+		byID := map[string]entry{}
+		byKey := map[string]string{} // name/alias → id
+		var out []string
+		seen := map[string]bool{}
+		add := func(id string) {
+			if id == "" || seen[id] {
+				return
+			}
+			seen[id] = true
 			out = append(out, id)
 		}
+		for _, m := range env.Data.Models {
+			if m.ID == "" {
+				continue
+			}
+			byID[m.ID] = entry{m.Disabled}
+			if m.Name != "" {
+				byKey[m.Name] = m.ID
+			}
+			for _, al := range m.Aliases {
+				if al != "" {
+					byKey[al] = m.ID
+				}
+			}
+		}
+		for _, m := range env.Data.Models {
+			if !m.Disabled {
+				add(m.ID)
+			}
+		}
+		for _, ag := range env.Data.Agents {
+			for _, ref := range ag.Models {
+				key := ""
+				switch v := ref.(type) {
+				case string:
+					key = v
+				case map[string]any:
+					key = wbStrOr(v["id"])
+					if key == "" {
+						key = wbStrOr(v["name"])
+					}
+				}
+				key = strings.TrimSpace(key)
+				if key == "" {
+					continue
+				}
+				id := key
+				if e, ok := byID[key]; ok {
+					if e.disabled {
+						continue
+					}
+				} else if mapped, ok := byKey[key]; ok {
+					if byID[mapped].disabled {
+						continue
+					}
+					id = mapped
+				} else {
+					continue // 未命中根表的引用不可服务
+				}
+				add(id)
+			}
+		}
+		// availableModels 非空 = 账号层白名单（对齐 codebuddy2api finish()；WorkBuddy 空表不过滤）。
+		if len(env.Data.AvailableModels) > 0 {
+			avail := map[string]bool{}
+			for _, v := range env.Data.AvailableModels {
+				avail[v] = true
+			}
+			filtered := out[:0]
+			for _, id := range out {
+				if avail[id] {
+					filtered = append(filtered, id)
+				}
+			}
+			out = filtered
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("workbuddy models api returned empty list")
+		}
+		return out, nil
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("workbuddy models api returned empty cli list")
+
+	union := map[string]bool{}
+	var order []string
+	okCount := 0
+	for _, url := range []string{v3URL, legacyURL} {
+		ids, err := fetchOne(url)
+		if err != nil {
+			log.Printf("[workbuddy] uid=%s %s 模型探测失败: %v", wbUID8(info.UID), realm, err)
+			continue
+		}
+		okCount++
+		for _, id := range ids {
+			if !union[id] {
+				union[id] = true
+				order = append(order, id)
+			}
+		}
 	}
-	return out, nil
+	if okCount == 0 {
+		return nil, false, fmt.Errorf("workbuddy models: all endpoints failed")
+	}
+	return order, okCount < 2, nil
 }
 
 // wbUserResource 查询账号剩余可花积分（CN/global 计费端点自动选路）。
@@ -2222,6 +2431,11 @@ type wbAccountSnapshot struct {
 	FailStreak   int    `json:"fail_streak"`
 	LastError    string `json:"last_error,omitempty"`
 	TokenExpires string `json:"token_expires,omitempty"`
+	// 专属页扩展字段（对齐 workbuddy-manager 账号台账）
+	SuccessCount int64     `json:"success_count"`
+	ErrTotal     int64     `json:"err_total"`
+	LastSuccess  string    `json:"last_success,omitempty"`
+	LastErrorAt  time.Time `json:"-"`
 }
 
 func wbSnapshotPool(p *wbPool) []wbAccountSnapshot {
@@ -2240,6 +2454,7 @@ func wbSnapshotPool(p *wbPool) []wbAccountSnapshot {
 			Disabled: a.disabled, DisabledWhy: a.disabledReason,
 			CoolingModel: a.coolingModel, CoolingWhy: a.coolingReason, FailStreak: a.failStreak,
 			LastError: a.lastError,
+			SuccessCount: a.successCount, ErrTotal: a.errTotal,
 		}
 		if now.Before(a.coolingUntil) {
 			s.CoolingUntil = a.coolingUntil.Format(time.RFC3339)
@@ -2249,6 +2464,12 @@ func wbSnapshotPool(p *wbPool) []wbAccountSnapshot {
 		}
 		if a.ExpiresAt > 0 {
 			s.TokenExpires = time.Unix(a.ExpiresAt, 0).Format(time.RFC3339)
+		}
+		if !a.lastSuccess.IsZero() {
+			s.LastSuccess = a.lastSuccess.Format(time.RFC3339)
+		}
+		if !a.lastErrorAt.IsZero() {
+			s.LastErrorAt = a.lastErrorAt
 		}
 		out = append(out, s)
 	}
@@ -2264,9 +2485,21 @@ func wbErrResponse(kind wbErrKind, status int, body []byte) ([]byte, int) {
 			"message": wbContentBlockedMessage(string(body)), "type": "content_blocked", "code": "content_blocked",
 		}})
 		return body, http.StatusBadRequest
-	case wbErrHardCredit, wbErrSessionDead, wbErrAccountFault:
+	case wbErrWAF:
+		// 不透传 WAF 的 HTML 拦截页：客户端拿到 403+HTML 只会误解成「api 密钥无效」。
+		// 回干净的 JSON 并保留上游状态码，提示这是临时风控、稍后重试。
 		body, _ := json.Marshal(map[string]any{"error": map[string]any{
-			"message": "workbuddy 账号不可用：" + msg, "type": "upstream_error",
+			"message": "workbuddy 上游 WAF 临时拦截（非密钥问题，账号凭据有效）。通常几分钟内自行恢复，网关已自动冷却该账号并轮转；若持续出现请稍后重试或更换出口代理。",
+			"type":    "upstream_error", "code": "upstream_waf_blocked",
+		}})
+		return body, http.StatusForbidden
+	case wbErrHardCredit, wbErrSessionDead, wbErrAccountFault:
+		hint := ""
+		if kind == wbErrAccountFault && strings.Contains(strings.ToLower(msg), "trial") {
+			hint = "（该账号为试用版未激活 14017：需在官网开通正式套餐后才能调用；网关已自动冷却该账号并轮转到其他账号）"
+		}
+		body, _ := json.Marshal(map[string]any{"error": map[string]any{
+			"message": "workbuddy 账号不可用：" + msg + hint, "type": "upstream_error",
 		}})
 		return body, http.StatusServiceUnavailable
 	}
@@ -2607,11 +2840,14 @@ func wbProbeModelsForRealm(ctx context.Context, pool *wbPool, cfg *UpstreamConfi
 			break
 		}
 		pctx, pcancel := context.WithTimeout(ctx, 8*time.Second)
-		ids, err := wbFetchModels(pctx, cfg, a, proxy)
+		ids, partial, err := wbFetchModels(pctx, cfg, a, proxy)
 		pcancel()
 		if err != nil {
 			log.Printf("[workbuddy] uid=%s %s 域模型探测失败: %v", wbUID8(a.UID), realm, err)
 			continue
+		}
+		if partial {
+			log.Printf("[workbuddy] uid=%s %s 域模型探测部分成功（仅单端点返回，列表可能不全）", wbUID8(a.UID), realm)
 		}
 		anyOK = true
 		for _, id := range ids {
@@ -3205,6 +3441,363 @@ func wbKeepAliveTick() {
 
 // ======================== 管理端点 ========================
 
+// wbFileAccount 凭证文件级账号台账条目：文件视图 + 池内运行态合并。
+// 池外文件（.disabled / 解析失败）也要可见可操作——否则「禁用」在体验上等同「删除」。
+type wbFileAccount struct {
+	File          string `json:"file"`                     // base 文件名（含 .disabled 后缀如适用）
+	DisabledByFile bool  `json:"disabled_by_file"`         // 面板改名禁用（workbuddy*.json.disabled）
+	Realm         string `json:"realm"`
+	UID           string `json:"uid,omitempty"`
+	Nickname      string `json:"nickname,omitempty"`
+	Domain        string `json:"domain,omitempty"`
+	EnterpriseID  string `json:"enterprise_id,omitempty"`
+	TokenExpires  string `json:"token_expires,omitempty"`
+	TokenTTLSec   int64  `json:"token_ttl_seconds,omitempty"` // 本次令牌总时长（JWT iat→exp，进度条分母）
+	IssuedAt      string `json:"issued_at,omitempty"`         // ≈ 最近一次刷新时刻
+	InPool        bool   `json:"in_pool"`                     // 是否在运行时账号池内
+	InvalidReason string `json:"invalid_reason,omitempty"`    // 能本地确定「上游不会加载它」的原因
+	Credits       *int64 `json:"credits,omitempty"`           // -1 = 查询失败
+
+	// 池内运行态（未入池时为零值）
+	InFlight     int    `json:"in_flight"`
+	Disabled     bool   `json:"disabled"`
+	DisabledWhy  string `json:"disabled_reason,omitempty"`
+	CoolingUntil string `json:"cooling_until,omitempty"`
+	CoolingModel string `json:"cooling_model,omitempty"`
+	CoolingWhy   string `json:"cooling_reason,omitempty"`
+	BreakerUntil string `json:"breaker_until,omitempty"`
+	FailStreak   int    `json:"fail_streak"`
+	LastError    string `json:"last_error,omitempty"`
+	SuccessCount int64  `json:"success_count"`
+	ErrTotal     int64  `json:"err_total"`
+	LastSuccess  string `json:"last_success,omitempty"`
+}
+
+// wbParseAuthLight 只读解析凭证文件的用户侧字段，不构建 wbAccount（供台账展示）。
+func wbParseAuthLight(raw []byte) (uid, nickname, realm, domain, entID string, expiresAt int64, ok bool) {
+	a, err := wbParseAuth(raw)
+	if err == nil {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.UID, a.Nickname, wbResolveRealm(a.Realm, a.Domain), a.Domain, a.EnterpriseID, a.ExpiresAt, true
+	}
+	var f struct {
+		UID      string `json:"uid"`
+		Nickname string `json:"nickname"`
+		Realm    string `json:"realm"`
+		Domain   string `json:"domain"`
+		Ent      string `json:"enterpriseId"`
+		Exp      int64  `json:"expiresAt"`
+	}
+	if json.Unmarshal(raw, &f) == nil {
+		return f.UID, f.Nickname, wbResolveRealm(f.Realm, f.Domain), f.Domain, f.Ent, f.Exp, true
+	}
+	return
+}
+
+// wbTokenTTLSeconds 从 JWT 解 iat→exp 总时长；解不出返回 0。
+func wbTokenTTLSeconds(token string) int64 {
+	iat, exp, ok := wbDecodeJWTClaims(token)
+	if !ok || exp <= 0 || iat <= 0 || exp <= iat {
+		return 0
+	}
+	return exp - iat
+}
+
+func wbTokenIssuedAt(token string) int64 {
+	iat, _, ok := wbDecodeJWTClaims(token)
+	if !ok {
+		return 0
+	}
+	return iat
+}
+
+// jwtSegmentDecode 解 JWT 的 base64url 段（无填充）。
+func jwtSegmentDecode(seg string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(strings.TrimSpace(seg))
+}
+
+// wbDecodeJWTClaims 解 access token（JWT）的 iat/exp 声明。
+func wbDecodeJWTClaims(token string) (iat, exp int64, ok bool) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return 0, 0, false
+	}
+	payload, err := jwtSegmentDecode(parts[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	var claims struct {
+		Iat int64 `json:"iat"`
+		Exp int64 `json:"exp"`
+	}
+	if json.Unmarshal(payload, &claims) != nil {
+		return 0, 0, false
+	}
+	return claims.Iat, claims.Exp, claims.Exp > 0
+}
+
+// wbFileAccessToken 从凭证文件原始 JSON 提取 access token（嵌套 auth.accessToken 优先，
+// 回退扁平 accessToken）。解不出返回空串。
+func wbFileAccessToken(raw []byte) string {
+	var nested struct {
+		Auth struct {
+			AccessToken string `json:"accessToken"`
+		} `json:"auth"`
+	}
+	if json.Unmarshal(raw, &nested) == nil && strings.TrimSpace(nested.Auth.AccessToken) != "" {
+		return strings.TrimSpace(nested.Auth.AccessToken)
+	}
+	var flat struct {
+		AccessToken string `json:"accessToken"`
+	}
+	if json.Unmarshal(raw, &flat) == nil {
+		return strings.TrimSpace(flat.AccessToken)
+	}
+	return ""
+}
+
+// wbAccountsHandler GET /api/wb/accounts?upstream=name&credits=1
+// 账号台账：凭证目录文件清单 + 池内运行态 + （可选）实时余额。requireAuth 注册。
+func wbAccountsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	want := strings.TrimSpace(r.URL.Query().Get("upstream"))
+	withCredits := r.URL.Query().Get("credits") == "1"
+	wbReloadPools()
+	type entry struct {
+		Upstream string          `json:"upstream"`
+		AuthDir  string          `json:"auth_dir"`
+		Total    int             `json:"total"`
+		Accounts []*wbFileAccount `json:"accounts"`
+	}
+	var out []entry
+	for name, cfg := range getConfiguredUpstreams() {
+		if cfg == nil || cfg.APIType != UpstreamWorkBuddy {
+			continue
+		}
+		if want != "" && want != name {
+			continue
+		}
+		dir := wbAuthDirOf(cfg)
+		p := wbPoolFor(cfg)
+		// 只在锁内做「文件→账号」映射与快照拷贝；锁内绝不能调用会再次加锁的
+		// wbSnapshotPool（sync.Mutex 不可重入，会死锁挂死整个池）。
+		p.mu.Lock()
+		poolByFile := map[string]*wbAccount{}
+		for _, key := range p.order {
+			if a := p.accounts[key]; a != nil {
+				poolByFile[filepath.Base(a.FilePath)] = a
+			}
+		}
+		keys := make([]string, len(p.order))
+		copy(keys, p.order)
+		p.mu.Unlock()
+		snap := wbSnapshotPool(p)
+		snapByFile := map[string]wbAccountSnapshot{}
+		for _, s := range snap {
+			snapByFile[s.FilePath] = s
+		}
+		e := entry{Upstream: name, AuthDir: dir}
+		files, _ := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
+		disabledFiles, _ := filepath.Glob(filepath.Join(dir, "workbuddy*.json.disabled"))
+		files = append(files, disabledFiles...)
+		sort.Strings(files)
+		for _, f := range files {
+			raw, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			fa := &wbFileAccount{File: filepath.Base(f), DisabledByFile: strings.HasSuffix(f, ".disabled")}
+			if uid, nick, realm, domain, ent, exp, ok := wbParseAuthLight(raw); ok {
+				fa.UID, fa.Nickname, fa.Realm, fa.Domain, fa.EnterpriseID = uid, nick, realm, domain, ent
+				if exp > 0 {
+					fa.TokenExpires = time.Unix(exp, 0).Format(time.RFC3339)
+				}
+			} else {
+				fa.InvalidReason = "凭证文件解析失败"
+			}
+			// 令牌签发信息直接从文件里的 access token 解（JWT iat/exp）。
+			if tok := wbFileAccessToken(raw); tok != "" {
+				if ttl := wbTokenTTLSeconds(tok); ttl > 0 {
+					fa.TokenTTLSec = ttl
+				}
+				if iss := wbTokenIssuedAt(tok); iss > 0 {
+					fa.IssuedAt = time.Unix(iss, 0).Format(time.RFC3339)
+				}
+			}
+			if fa.UID == "" && !fa.DisabledByFile && fa.InvalidReason == "" {
+				fa.InvalidReason = "缺少 uid（上游不会加载）"
+			}
+			if s, ok := snapByFile[fa.File]; ok {
+				fa.InPool = true
+				fa.InFlight = s.InFlight
+				fa.Disabled = s.Disabled
+				fa.DisabledWhy = s.DisabledWhy
+				fa.CoolingUntil = s.CoolingUntil
+				fa.CoolingModel = s.CoolingModel
+				fa.CoolingWhy = s.CoolingWhy
+				fa.BreakerUntil = s.BreakerUntil
+				fa.FailStreak = s.FailStreak
+				fa.LastError = s.LastError
+				fa.SuccessCount = s.SuccessCount
+				fa.ErrTotal = s.ErrTotal
+				fa.LastSuccess = s.LastSuccess
+			} else if fa.DisabledByFile {
+				fa.InvalidReason = "已在本面板临时禁用（不会被加载）"
+			} else if fa.InvalidReason == "" {
+				fa.InvalidReason = "未在运行时账号池内"
+			}
+			e.Accounts = append(e.Accounts, fa)
+			e.Total++
+		}
+		if withCredits {
+			proxy := getFirstConfiguredSocks5ProxyAddr()
+			for _, fa := range e.Accounts {
+				rem := int64(-1)
+				if a := poolByFile[fa.File]; a != nil {
+					ctx, cancel := context.WithTimeout(context.Background(), wbRPCDeadline)
+					if remain, err := wbUserResource(ctx, cfg, a, proxy); err == nil {
+						rem = remain
+					}
+					cancel()
+				}
+				fa.Credits = &rem
+			}
+		}
+		out = append(out, e)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"upstreams": out})
+}
+
+// wbAccountActionHandler POST /api/wb/accounts/action
+// body: {upstream, file, action}，action ∈ delete|disable|enable。
+// disable/enable 用改名实现（.disabled 后缀不再匹配加载 glob，凭证字节不动、可逆）。
+func wbAccountActionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Upstream string `json:"upstream"`
+		File     string `json:"file"`
+		Action   string `json:"action"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	cfg := getConfiguredUpstreams()[strings.TrimSpace(req.Upstream)]
+	if cfg == nil || cfg.APIType != UpstreamWorkBuddy {
+		http.Error(w, `{"error":"unknown workbuddy upstream"}`, http.StatusNotFound)
+		return
+	}
+	base := filepath.Base(strings.TrimSpace(req.File))
+	if !strings.HasPrefix(base, "workbuddy") || !(strings.HasSuffix(base, ".json") || strings.HasSuffix(base, ".json.disabled")) {
+		http.Error(w, `{"error":"invalid file name"}`, http.StatusBadRequest)
+		return
+	}
+	dir := wbAuthDirOf(cfg)
+	plain := strings.TrimSuffix(base, ".disabled")
+	disabled := plain + ".disabled"
+	src, dst := filepath.Join(dir, plain), filepath.Join(dir, disabled)
+	respond := func(msg string) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "file": base, "message": msg})
+	}
+	switch req.Action {
+	case "delete":
+		target := src
+		if _, err := os.Stat(disabled); err == nil {
+			target = disabled
+		}
+		if err := os.Remove(target); err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+		wbReloadPools()
+		respond("已删除")
+	case "disable":
+		if _, err := os.Stat(src); err != nil {
+			http.Error(w, `{"error":"账号文件不存在"}`, http.StatusNotFound)
+			return
+		}
+		if _, err := os.Stat(dst); err == nil {
+			respond("已是禁用状态")
+			return
+		}
+		if err := os.Rename(src, dst); err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+		wbReloadPools()
+		respond("已临时禁用（改名 .disabled，可逆）")
+	case "enable":
+		if _, err := os.Stat(dst); err != nil {
+			if _, err := os.Stat(src); err == nil {
+				respond("已是启用状态")
+				return
+			}
+			http.Error(w, `{"error":"账号文件不存在"}`, http.StatusNotFound)
+			return
+		}
+		if err := os.Rename(dst, src); err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+		wbReloadPools()
+		respond("已启用")
+	default:
+		http.Error(w, `{"error":"action 仅支持 delete|disable|enable"}`, http.StatusBadRequest)
+	}
+}
+
+// wbAccountCreditHandler POST /api/wb/accounts/credit?upstream=name&file=xxx
+// 单账号实时余额刷新（不整表刷，避免多号时每次全量打上游）。
+func wbAccountCreditHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimSpace(r.URL.Query().Get("upstream"))
+	file := filepath.Base(strings.TrimSpace(r.URL.Query().Get("file")))
+	cfg := getConfiguredUpstreams()[name]
+	if cfg == nil || cfg.APIType != UpstreamWorkBuddy {
+		http.Error(w, `{"error":"unknown workbuddy upstream"}`, http.StatusNotFound)
+		return
+	}
+	p := wbPoolFor(cfg)
+	p.mu.Lock()
+	var a *wbAccount
+	for _, key := range p.order {
+		if cand := p.accounts[key]; cand != nil && filepath.Base(cand.FilePath) == file {
+			a = cand
+			break
+		}
+	}
+	p.mu.Unlock()
+	if a == nil {
+		http.Error(w, `{"error":"账号不在池内（可能被禁用或未加载）"}`, http.StatusNotFound)
+		return
+	}
+	proxy := getFirstConfiguredSocks5ProxyAddr()
+	ctx, cancel := context.WithTimeout(context.Background(), wbRPCDeadline)
+	defer cancel()
+	remain, err := wbUserResource(ctx, cfg, a, proxy)
+	out := map[string]any{"ok": err == nil, "file": file}
+	if err != nil {
+		out["error"] = err.Error()
+		out["credits"] = -1
+	} else {
+		out["credits"] = remain
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 // wbStatusHandler GET /api/wb/status —— 各 workbuddy 上游的账号池状态（requireAuth 注册）。
 // 展示前先重扫凭证目录：手动往 auths/ 拷入/删除的凭据文件即时生效，不必等后台重扫。
 func wbStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -3276,18 +3869,21 @@ func wbApplyConfig(ups map[string]*UpstreamConfig, changed bool) {
 	}
 }
 
-// wbCheckinHandler POST /api/wb/checkin?upstream=name —— 手动触发签到（对齐 workbuddy2api signin.sh）。
-// 不带 upstream 参数时对全部 workbuddy 上游执行。CN 账号幂等：已签到视为成功。
+// wbCheckinHandler POST /api/wb/checkin?upstream=name&file=xxx —— 手动触发签到（对齐 workbuddy2api signin.sh）。
+// 不带 upstream 参数时对全部 workbuddy 上游执行；带 file 时只签到该账号（单号签到）。
+// CN 账号幂等：已签到视为成功。
 func wbCheckinHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	want := strings.TrimSpace(r.URL.Query().Get("upstream"))
+	wantFile := filepath.Base(strings.TrimSpace(r.URL.Query().Get("file")))
 	type result struct {
 		Upstream string `json:"upstream"`
 		UID      string `json:"uid"`
 		Realm    string `json:"realm"`
+		File     string `json:"file,omitempty"`
 		OK       bool   `json:"ok"`
 		Msg      string `json:"msg,omitempty"`
 	}
@@ -3306,7 +3902,12 @@ func wbCheckinHandler(w http.ResponseWriter, r *http.Request) {
 			if a == nil {
 				continue
 			}
-			res := result{Upstream: name, UID: wbUID8(a.snapshot().UID)}
+			snap := a.snapshot()
+			file := a.filePath()
+			if wantFile != "" && filepath.Base(file) != wantFile {
+				continue
+			}
+			res := result{Upstream: name, UID: wbUID8(snap.UID), File: filepath.Base(file)}
 			ctx, cancel := context.WithTimeout(context.Background(), wbRPCDeadline)
 			err := wbDailyCheckin(ctx, cfg, a, proxy)
 			cancel()
